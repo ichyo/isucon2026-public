@@ -142,12 +142,22 @@ impl Signer {
     pub fn sign_many(&self, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
         let mut out = vec![[0u8; 32]; jobs.len()];
         let mut missing: Vec<usize> = Vec::new();
+        // the same image often appears many times in one response (an author's profile image on every
+        // memory/export item): compute it once, copy it to the duplicates afterwards
+        let mut dups: Vec<(usize, usize)> = Vec::new();
         {
             let c = self.cache.lock();
+            let mut first: FxHashMap<Id, usize> = FxHashMap::default();
             for (i, (img, _)) in jobs.iter().enumerate() {
                 match c.get(&(*img, exp)) {
                     Some(s) => out[i] = *s,
-                    None => missing.push(i),
+                    None => match first.entry(*img) {
+                        std::collections::hash_map::Entry::Occupied(e) => dups.push((i, *e.get())),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(i);
+                            missing.push(i);
+                        }
+                    },
                 }
             }
         }
@@ -171,6 +181,9 @@ impl Signer {
         for (i, s) in computed {
             out[i] = s;
             c.insert((jobs[i].0, exp), s);
+        }
+        for (i, j) in dups {
+            out[i] = out[j];
         }
         out
     }
@@ -230,5 +243,13 @@ mod tests {
             assert_eq!(r[i], compute(k, *img, 99));
         }
         assert_eq!(s.len(), 10);
+        // duplicates within one call (computed once, copied)
+        let img = Id::new_v4();
+        let jobs: Vec<_> = (0..12).map(|i| if i % 3 == 0 { (img, key) } else { (Id::new_v4(), key) }).collect();
+        let r = s.sign_many(&jobs, 99);
+        for (i, (img, k)) in jobs.iter().enumerate() {
+            assert_eq!(r[i], compute(k, *img, 99));
+        }
+        assert_eq!(s.len(), 10 + 1 + 8);
     }
 }
