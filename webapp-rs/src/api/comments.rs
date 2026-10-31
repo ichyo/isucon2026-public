@@ -67,7 +67,7 @@ pub(crate) fn bind_cursor(req: &Req, ts_key: &str, id_key: &str) -> Result<Optio
 
 // POST /api/posts/{postId}/comments — auth user, pinned.
 pub async fn create_comment(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let post = req.param(0).to_string();
     let body = req.bind().await?;
     let text = body.str("body")?.unwrap_or_default();
@@ -102,7 +102,7 @@ pub fn exec_create_comment(st: &State, tx: &mut Tx, actor: Id, post: &str, body:
 // GET /api/posts/{postId}/comments[?afterCreatedAt=&afterId=] — auth user, pinned.
 // Order: createdAt ASC, id ASC; cursor (createdAt, id) > cursor; non-deleted comments by active authors.
 pub async fn get_comments(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let cursor = bind_cursor(&req, "afterCreatedAt", "afterId")?;
     let post = req.param(0);
     ctx.respond(200, |st, w| {
@@ -131,7 +131,7 @@ pub async fn get_comments(ctx: Ctx, req: Req) -> HResult {
 
 // DELETE /api/comments/{commentId} — auth user, pinned.
 pub async fn delete_comment(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let comment = req.param(0).to_string();
     ctx.write(Command::DeleteComment { actor: me.id, comment }).await?;
     Ok(Resp::no_content())

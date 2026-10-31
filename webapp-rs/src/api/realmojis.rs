@@ -22,7 +22,7 @@ pub const REALMOJI_BODY_CAP: usize = 4 * 1024 * 1024 + 64 * 1024;
 // POST /api/posts/{postId}/realmojis — auth user, pinned, multipart (`image` file, `reactionType`).
 // Input checks (400) all come before any state check; the JPEG is fully decoded off-lock before ctx.write.
 pub async fn replace_real_moji(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let post = req.param(0).to_string();
     // bounded buffering: over REALMOJI_BODY_CAP ⇒ the same 400 invalid_realmoji the decoder would give
     let Some(body) = req.bind_capped(REALMOJI_BODY_CAP).await? else { return Err(invalid()) };
@@ -71,7 +71,7 @@ pub fn exec_put_realmoji(st: &State, tx: &mut Tx, actor: Id, post: &str, reactio
 // GET /api/posts/{postId}/realmojis[?beforeCreatedAt=&beforeId=] — auth user, pinned.
 // Order: createdAt DESC, id DESC; cursor (createdAt, id) < cursor; current RealMojis by active reactors.
 pub async fn get_real_mojis(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let cursor = bind_cursor(&req, "beforeCreatedAt", "beforeId")?;
     let post = req.param(0);
     ctx.respond(200, |st, w| {
@@ -100,7 +100,7 @@ pub async fn get_real_mojis(ctx: Ctx, req: Req) -> HResult {
 
 // DELETE /api/realmojis/{realMojiId} — auth user, pinned.
 pub async fn delete_real_moji(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let realmoji = req.param(0).to_string();
     ctx.write(Command::DeleteRealMoji { actor: me.id, realmoji }).await?;
     Ok(Resp::no_content())

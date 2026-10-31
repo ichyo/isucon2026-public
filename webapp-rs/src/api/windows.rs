@@ -4,7 +4,7 @@ use super::prelude::*;
 
 // GET /api/posting-window/current — auth user, pinned.
 pub async fn get_current_posting_window(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let now = now_us();
     ctx.respond(200, |st, w| {
         let region = st.user(me.idx).region;

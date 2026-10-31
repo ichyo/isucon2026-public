@@ -23,8 +23,7 @@ pub enum AckMode {
 }
 
 /// Actions that may use `WaitPolicy::LeaderOnly` (ISUREAL_ASYNC_ACTIONS): purely additive writes only.
-pub const ASYNC_CAPABLE: [&str; 8] =
-    ["create_post", "create_comment", "replace_real_moji", "create_friend_request", "follow", "register", "login", "certify_user"];
+pub const ASYNC_CAPABLE: [&str; 7] = ["create_post", "create_comment", "replace_real_moji", "create_friend_request", "follow", "register", "certify_user"];
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -43,6 +42,10 @@ pub struct Config {
     pub blob_listen: String,
     /// blob service address of every node (index = NodeId::idx())
     pub blob_peers: [Option<String>; NodeId::COUNT],
+    /// Private regional-session RPC listener; never expose this trusted-peer protocol publicly.
+    pub session_listen: String,
+    /// Regional-session service addresses (index = NodeId::idx()).
+    pub session_peers: [Option<String>; NodeId::COUNT],
     /// uploads larger than this are stored on the origin node only (not replicated in the log)
     pub blob_inline_max: usize,
     pub data_dir: PathBuf,
@@ -87,6 +90,7 @@ fn env(name: &str) -> Option<String> {
 }
 
 pub const DEFAULT_BLOB_PEERS: &str = "asia1=192.168.1.10:7001,asia2=192.168.4.10:7001,europe1=192.168.2.10:7001,america1=192.168.3.10:7001";
+pub const DEFAULT_SESSION_PEERS: &str = "asia1=192.168.1.10:7003,asia2=192.168.4.10:7003,europe1=192.168.2.10:7003,america1=192.168.3.10:7003";
 pub const DEFAULT_BLOB_INLINE_MAX: usize = 64 * 1024;
 
 /// Replication address of a node (port 7000 on its private IP).
@@ -154,6 +158,8 @@ impl Config {
             control_listen: env("ISUREAL_CONTROL_LISTEN").unwrap_or_else(|| "127.0.0.1:9100".into()),
             blob_listen: env("ISUREAL_BLOB_LISTEN").unwrap_or_else(|| "0.0.0.0:7001".into()),
             blob_peers: crate::blobs::parse_peers(&env("ISUREAL_BLOB_PEERS").unwrap_or_else(|| DEFAULT_BLOB_PEERS.into()))?,
+            session_listen: env("ISUREAL_SESSION_LISTEN").unwrap_or_else(|| format!("{}:7003", node.private_ip())),
+            session_peers: crate::blobs::parse_peers(&env("ISUREAL_SESSION_PEERS").unwrap_or_else(|| DEFAULT_SESSION_PEERS.into()))?,
             blob_inline_max: num("ISUREAL_BLOB_INLINE_MAX", DEFAULT_BLOB_INLINE_MAX as u64)? as usize,
             data_dir: env("ISUREAL_DATA_DIR").unwrap_or_else(|| "/home/isucon/data".into()).into(),
             initial_dir: env("ISUREAL_INITIAL_DIR").unwrap_or_else(|| "/home/isucon/initial".into()).into(),
@@ -195,6 +201,8 @@ impl Config {
             control_listen: "127.0.0.1:0".into(),
             blob_listen: "127.0.0.1:0".into(),
             blob_peers: Default::default(),
+            session_listen: "127.0.0.1:0".into(),
+            session_peers: Default::default(),
             blob_inline_max: DEFAULT_BLOB_INLINE_MAX,
             data_dir: data.into(),
             initial_dir: initial.into(),

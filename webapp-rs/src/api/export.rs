@@ -7,7 +7,7 @@ use super::prelude::*;
 
 // GET /api/me/export — auth user, pinned.
 pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     // Under the read lock: posts.json (signatures still pending) + the image locations, in export order.
     let mut locs: Vec<(Id, ImageLoc)> = Vec::new();
     let w = ctx.render(|st, w| {

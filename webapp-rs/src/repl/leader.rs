@@ -261,7 +261,7 @@ impl Leader {
     pub async fn initialize(&self, app: &'static App) -> Result<(), ApiError> {
         let _g = self.init_lock.lock().await;
         let t0 = Instant::now();
-        let fresh = super::clone_pristine(app).await;
+        let mut fresh = super::clone_pristine(app).await;
         let mut epoch = rand_u64();
         let (old, links) = {
             let mut st = app.state.write();
@@ -271,6 +271,7 @@ impl Leader {
             }
             app.wal.reset(&mut wal, epoch).map_err(|e| ApiError::internal(format!("wal reset: {e}")))?;
             *self.head.lock() = (epoch, 0);
+            fresh.epoch = epoch;
             let old = app.swap_state(&mut st, fresh);
             app.images.reset_uploads_for_epoch(epoch);
             let links: Vec<Arc<Link>> = self.links.lock().clone();

@@ -42,6 +42,9 @@ pub struct App {
     /// batches concurrent image-signature verification misses into SIMD passes
     pub sigbatch: crate::sigshare::VerifyBatcher,
     pub sigwarm: crate::sigwarm::Warmer,
+    pub session_store: crate::session_store::SessionStore,
+    pub session_net: crate::session_net::SessionNet,
+    pub session_locks: crate::sessions::UserLocks,
 }
 
 /// The authenticated session user (copied out of the state; safe to keep across awaits).
@@ -92,18 +95,15 @@ impl App {
     }
 
     /// `Authorization: Bearer <token>` of an active session of an active user, else 401 invalid_session.
-    pub fn auth_user(&self, req: &Req) -> Result<AuthUser, ApiError> {
+    pub async fn auth_user(&'static self, req: &Req) -> Result<AuthUser, ApiError> {
         let err = || ApiError::unauthorized("invalid_session");
         let token = Id::parse(bearer(req).ok_or_else(err)?).ok_or_else(err)?;
-        let st = self.state.read_recursive();
-        let u = st.session_user(token).ok_or_else(err)?;
-        let usr = st.user(u);
-        Ok(AuthUser { idx: u, id: usr.id, region: usr.region, token })
+        crate::sessions::authenticate(self, token).await
     }
 
     /// `auth_user` + region pinning (403 region_mismatch).
-    pub fn auth_pinned(&self, req: &Req) -> Result<AuthUser, ApiError> {
-        let a = self.auth_user(req)?;
+    pub async fn auth_pinned(&'static self, req: &Req) -> Result<AuthUser, ApiError> {
+        let a = self.auth_user(req).await?;
         if a.region != self.cfg.region {
             return Err(ApiError::forbidden("region_mismatch"));
         }
@@ -166,7 +166,15 @@ impl App {
         }
     }
 
-    pub async fn write_with(&'static self, mut cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
+    pub async fn write_with(&'static self, cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
+        if crate::sessions::is_regional(&cmd) {
+            return crate::sessions::write(self, cmd).await;
+        }
+        self.write_replicated(cmd, policy).await
+    }
+
+    /// Global business-data path; regional sessions use this only for their fenced ownership transfer.
+    pub(crate) async fn write_replicated(&'static self, mut cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
         let big = matches!(cmd.blob(), Some(Blob::Inline(b)) if b.len() > self.cfg.blob_inline_max);
         let dry = !matches!(cmd, Command::Initialize | Command::Ban { .. } | Command::AbuseReport { .. }) && (!self.is_leader() || big);
         if dry {

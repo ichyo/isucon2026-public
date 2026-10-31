@@ -293,11 +293,12 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
                     let r: Reset = proto::decode(&payload)?;
                     f.resetting.store(true, Ordering::SeqCst);
                     let t0 = Instant::now();
-                    let fresh = super::clone_pristine(app).await;
+                    let mut fresh = super::clone_pristine(app).await;
                     let (old, lsn, new_epoch) = {
                         let mut st = app.state.write();
                         let mut wal = app.wal.inner.lock();
                         app.wal.reset(&mut wal, r.epoch)?;
+                        fresh.epoch = r.epoch;
                         let old = app.swap_state(&mut st, fresh);
                         // a new epoch (initialize) drops uploaded blobs; a same-epoch resync must keep them
                         // (the leader's log still references blobs this node is the origin of)

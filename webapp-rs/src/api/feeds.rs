@@ -26,7 +26,7 @@ impl Feed {
 
 // GET /api/feeds/{feed} — auth user, pinned.
 pub async fn get_feed(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     // binding (unparsable values ⇒ 400 bind error) before validation
     let before_posted_at = req.query_time("beforePostedAt")?;
     let before_score = req.query_int("beforeScore")?;

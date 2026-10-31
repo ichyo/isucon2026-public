@@ -416,6 +416,7 @@ pub fn load(dir: &Path) -> Result<State> {
             incoming: Default::default(),
             outgoing: Default::default(),
             session: None,
+            session_generation: 0,
         });
     }
     let uid = |st: &State, id: Id| st.user_by_id.get(&id).copied().ok_or_else(|| anyhow!("unknown user {id}"));

@@ -387,8 +387,9 @@ pub struct User {
     pub incoming: FxHashMap<UIdx, FrIdx>,
     /// pending friend requests sent by me, keyed by recipient
     pub outgoing: FxHashMap<UIdx, FrIdx>,
-    /// the single active session token
+    /// Baseline from the legacy WAL or latest ownership transfer; the owner overlays its journal.
     pub session: Option<Id>,
+    pub session_generation: u64,
 }
 
 impl User {

@@ -8,7 +8,7 @@ const PROFILE_IMAGE_MAX: u16 = 512;
 
 // GET /api/me — auth user, pinned
 pub async fn get_me(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     ctx.respond(200, |st, w| {
         views::me(w, st.user(me.idx));
         Ok(())
@@ -18,7 +18,7 @@ pub async fn get_me(ctx: Ctx, req: Req) -> HResult {
 
 // PATCH /api/me — auth user, NOT pinned. Body JSON {displayName?, bio?, region?}; 200 Me (after update).
 pub async fn update_me(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_user(&req)?;
+    let me = ctx.auth_user(&req).await?;
     let body = req.bind().await?;
     // binding first (a wrong JSON type in any field ⇒ 400 bind error), then validation
     let display_name = body.str("displayName")?;
@@ -60,7 +60,7 @@ pub const PROFILE_IMAGE_BODY_CAP: usize = 4 * 1024 * 1024;
 // PUT /api/me/profile-image — auth user, not pinned. Content-Type must be exactly `image/jpeg` (415), raw
 // body = JPEG: undecodable ⇒ 400 + abuse InvalidImage; > 512 px ⇒ 400 (not abuse). 204.
 pub async fn put_profile_image(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_user(&req)?;
+    let me = ctx.auth_user(&req).await?;
     if req.header("content-type") != Some("image/jpeg") {
         return Err(ApiError::new(415, "unsupported_media_type"));
     }
@@ -91,7 +91,7 @@ pub fn exec_set_profile_image(st: &State, tx: &mut Tx, user: Id, image: &Blob) -
 
 // DELETE /api/me/profile-image — auth user, not pinned. No profile image ⇒ 404 account_not_found. 204.
 pub async fn delete_profile_image(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_user(&req)?;
+    let me = ctx.auth_user(&req).await?;
     ctx.write(Command::DeleteProfileImage { user: me.id }).await?;
     Ok(Resp::no_content())
 }
@@ -108,7 +108,7 @@ pub fn exec_delete_profile_image(st: &State, tx: &mut Tx, user: Id) -> ExecResul
 
 // POST /api/me/account-deletion — auth user, pinned. 204 (§4.7; all sessions dropped by apply).
 pub async fn delete_account(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     ctx.write(Command::DeleteAccount { user: me.id }).await?;
     Ok(Resp::no_content())
 }

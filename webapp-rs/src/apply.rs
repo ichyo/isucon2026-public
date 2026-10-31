@@ -63,6 +63,7 @@ pub fn apply(st: &mut State, e: &LogEntry, blob: Option<ImageLoc>, fx: &mut Vec<
                 incoming: Default::default(),
                 outgoing: Default::default(),
                 session: None,
+                session_generation: 0,
             });
             st.user_by_id.insert(*id, idx);
             st.user_by_name.insert(username.clone(), idx);
@@ -104,6 +105,23 @@ pub fn apply(st: &mut State, e: &LogEntry, blob: Option<ImageLoc>, fx: &mut Vec<
                 }
             }
             usr.updated_at = *at;
+        }
+        LogEntry::SessionMoved { user, region, generation, token, display_name, bio, at } => {
+            let Some(u) = user_of(st, *user) else { warn_skip!("session move for unknown user {user}") };
+            if let Some(old) = st.users[u as usize].session.take() {
+                st.sessions.remove(&old);
+            }
+            if let Some(token) = token {
+                st.sessions.insert(*token, u);
+            }
+            st.users[u as usize].session = *token;
+            st.users[u as usize].session_generation = *generation;
+            apply(
+                st,
+                &LogEntry::ProfileUpdated { user: *user, display_name: display_name.clone(), bio: bio.clone(), region: Some(*region), at: *at },
+                None,
+                fx,
+            );
         }
         LogEntry::ProfileImageSet { user, image, at } => {
             let Some(u) = user_of(st, *user) else { warn_skip!("profile image of unknown user {user}") };

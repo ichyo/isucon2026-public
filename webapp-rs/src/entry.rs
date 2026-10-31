@@ -44,6 +44,11 @@ pub enum LogEntry {
     RealMojiCreated { id: Id, post: Id, reactor: Id, image: Id, reaction: Reaction, at: Ts },
     RealMojiDeleted { id: Id, at: Ts },
     IpBanned { ip: String, until: Ts },
+    /// Atomic profile/authority transfer. Append variants to preserve old WAL discriminants.
+    SessionMoved {
+        user: Id, region: Region, generation: u64, token: Option<Id>,
+        display_name: Option<Arc<str>>, bio: Option<Arc<str>>, at: Ts,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

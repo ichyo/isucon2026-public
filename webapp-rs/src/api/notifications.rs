@@ -9,13 +9,13 @@ use super::prelude::*;
 
 // GET /api/notifications — auth user, pinned.
 pub async fn get_notifications(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     // Register under the state read lock: a WindowOpened apply (write lock) is then either entirely before
     // the registration (its startsAt < connectedAt ⇒ correctly not delivered) or after it (sees us), and a
     // deletion / region change since the auth check cannot slip in between (it would leave a dangling stream).
     let body = {
         let st = ctx.read();
-        if st.session_user(me.token) != Some(me.idx) {
+        if st.user_idx(me.id) != Some(me.idx) || !st.user(me.idx).is_active() {
             return Err(ApiError::unauthorized("invalid_session"));
         }
         if st.user(me.idx).region != ctx.region() {

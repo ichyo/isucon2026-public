@@ -12,7 +12,7 @@ fn certified(u: &User) -> bool {
 // Candidates: active users except the viewer and anyone blocked either way, (username, id) > cursor,
 // ordered by (username, id) asc. Bio only for certified accounts.
 pub async fn search_users(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let q = req.query("q").map(|v| v.into_owned()).unwrap_or_default();
     if !text::len_between(&q, 1, 100) {
         return Err(ApiError::bad_request("invalid_relationship"));
@@ -56,7 +56,7 @@ pub async fn search_users(ctx: Ctx, req: Req) -> HResult {
 // GET /api/users/{userId} — auth user, pinned. Missing / deleted / blocked either way ⇒ 404
 // relationship_not_found. Bio iff the target is certified or a friend of the viewer (§4.6).
 pub async fn get_user(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let target = req.param(0);
     ctx.respond(200, |st, w| {
         let t = st

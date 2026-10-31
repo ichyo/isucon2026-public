@@ -85,6 +85,11 @@ pub enum Command {
     /// validated JPEG (≤512×512)
     PutRealMoji { actor: Id, post: String, reaction: Reaction, image: Blob },
     DeleteRealMoji { actor: Id, realmoji: String },
+    /// Only the session owner creates this after durably freezing the old generation.
+    MoveSession {
+        epoch: u64, user: Id, from: Region, generation: u64, token: Option<Id>,
+        region: Region, display_name: Option<String>, bio: Option<String>,
+    },
 }
 
 impl Command {
@@ -110,7 +115,7 @@ impl Command {
             Command::Register { .. } => "register",
             Command::Login { .. } => "login",
             Command::Logout { .. } => "logout",
-            Command::UpdateProfile { .. } => "update_me",
+            Command::UpdateProfile { .. } | Command::MoveSession { .. } => "update_me",
             Command::SetProfileImage { .. } => "put_profile_image",
             Command::DeleteProfileImage { .. } => "delete_profile_image",
             Command::DeleteAccount { .. } => "delete_account",
@@ -213,6 +218,23 @@ pub fn exec(st: &State, tx: &mut Tx, cmd: &Command) -> ExecResult {
         Command::Logout { token } => auth::exec_logout(st, tx, *token),
         Command::UpdateProfile { user, display_name, bio, region } => {
             me::exec_update_profile(st, tx, *user, display_name.as_deref(), bio.as_deref(), *region)
+        }
+        Command::MoveSession { epoch, user, from, generation, token, region, display_name, bio } => {
+            let u = auth::active_actor(st, *user)?;
+            let usr = st.user(u);
+            if st.epoch != *epoch || usr.region != *from || usr.session_generation != *generation {
+                return Err(ApiError::unavailable("session ownership changed"));
+            }
+            tx.push(LogEntry::SessionMoved {
+                user: *user,
+                region: *region,
+                generation: generation + 1,
+                token: *token,
+                display_name: display_name.as_deref().map(Into::into),
+                bio: bio.as_deref().map(Into::into),
+                at: tx.now,
+            });
+            Ok(Outcome::Unit)
         }
         Command::SetProfileImage { user, image } => me::exec_set_profile_image(st, tx, *user, image),
         Command::DeleteProfileImage { user } => me::exec_delete_profile_image(st, tx, *user),

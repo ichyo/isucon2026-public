@@ -18,6 +18,8 @@ use crate::http::router::Router;
 use crate::images::ImageStore;
 use crate::model::{now_us, ImageLoc};
 use crate::repl::{self, Repl};
+use crate::session_net::SessionNet;
+use crate::session_store::SessionStore;
 use crate::sign::Signer;
 use crate::sse::SseHub;
 use crate::static_files::StaticFiles;
@@ -30,15 +32,17 @@ pub struct Node {
     pub repl_addr: Option<SocketAddr>,
     pub control_addr: Option<SocketAddr>,
     pub blob_addr: Option<SocketAddr>,
+    pub session_addr: SocketAddr,
 }
 
-/// Points every node's blob client at the others' actual blob-service addresses (tests / ephemeral ports).
+/// Points every node's internal clients at the others' actual service addresses (tests / ephemeral ports).
 pub fn wire_blob_peers(nodes: &[&Node]) {
     for n in nodes {
         for m in nodes {
             if let Some(a) = m.blob_addr {
                 n.app.images.net.set_peer(m.app.cfg.node, a.to_string());
             }
+            n.app.session_net.set_peer(m.app.cfg.node, m.session_addr.to_string());
         }
     }
 }
@@ -93,6 +97,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         "[start] blobs: listen={} peers={:?} inline_max={} bytes (larger uploads stay on their origin node)",
         cfg.blob_listen, cfg.blob_peers, cfg.blob_inline_max
     );
+    eprintln!("[start] sessions: listen={} peers={:?}", cfg.session_listen, cfg.session_peers);
     eprintln!(
         "[start] replication: ack_mode={:?} async_actions={:?} gate_silence_ms={} (runtime: {} threads at nice {}); budgets: jpeg={} sign={} (0 = CPUs)",
         cfg.ack_mode, cfg.async_actions, cfg.gate_silence_ms, 2, crate::rt::REPL_NICE, cfg.jpeg_concurrency, cfg.sign_concurrency
@@ -105,6 +110,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let live = repl::clone_pristine_arc(&pristine).await;
 
     let wal = Wal::open(&cfg.data_dir, cfg.fsync).context("opening WAL")?;
+    let session_store = SessionStore::open(&cfg.data_dir, cfg.fsync).context("opening session journal")?;
     let blobs = BlobStore::open(&cfg.data_dir, cfg.fsync).context("opening blob store")?;
     let cache = BlobCache::open(&cfg.data_dir).context("opening blob cache")?;
     let net = BlobNet::new(cfg.blob_peers.clone());
@@ -118,6 +124,9 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         signer: Signer::new(cfg.exp_quantum),
         sigbatch: crate::sigshare::VerifyBatcher::default(),
         sigwarm: crate::sigwarm::Warmer::default(),
+        session_net: SessionNet::new(cfg.session_peers.clone()),
+        session_store,
+        session_locks: Default::default(),
         cfg,
         state: RwLock::new(live),
         pristine,
@@ -139,6 +148,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         let node = app.cfg.node;
         let t = Instant::now();
         let mut st = app.state.write();
+        st.epoch = app.wal.inner.lock().epoch;
         let mut fx = Vec::new();
         let n = app
             .wal
@@ -157,6 +167,13 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     }
 
     app.sigwarm.start(app);
+    // Session authority must be reachable before this node starts serving traffic. Failing to bind is a
+    // startup error, rather than a partially functioning server that can never authenticate its users.
+    let session_listener = crate::rt::spawn(async move { TcpListener::bind(&app.cfg.session_listen).await })
+        .await?
+        .with_context(|| format!("bind session service {}", app.cfg.session_listen))?;
+    let session_addr = session_listener.local_addr()?;
+    crate::rt::spawn(crate::session_net::serve(app, session_listener));
 
     // replication
     let mut repl_addr = None;
@@ -228,6 +245,6 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let l = bind_backlog(&app.cfg.listen, 4096, rcvbuf).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
     let http_addr = l.local_addr()?;
     tokio::spawn(crate::http::serve(app, l));
-    eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} blob={blob_addr:?} control={control_addr:?} in {:.1?}", t0.elapsed());
-    Ok(Node { app, http_addr, repl_addr, control_addr, blob_addr })
+    eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} blob={blob_addr:?} session={session_addr} control={control_addr:?} in {:.1?}", t0.elapsed());
+    Ok(Node { app, http_addr, repl_addr, control_addr, blob_addr, session_addr })
 }

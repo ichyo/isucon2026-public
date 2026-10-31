@@ -107,6 +107,8 @@ impl ImageIndex {
 
 #[derive(Clone, Default)]
 pub struct State {
+    /// Global WAL epoch; fences regional session requests across initialize.
+    pub epoch: u64,
     pub users: Vec<User>,
     pub user_by_id: FxHashMap<Id, UIdx>,
     pub user_by_name: FxHashMap<Arc<str>, UIdx>,

@@ -25,7 +25,7 @@ fn cursor_and_period(req: &Req, period: impl FnOnce() -> Option<Period>) -> Resu
 
 // GET /api/memories?month=YYYY-MM — auth user, pinned.
 pub async fn get_memories(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let month = req.query("month").map(|m| m.into_owned());
     let (range, cursor) = cursor_and_period(&req, || timefmt::parse_month(month.as_deref()?))?;
     respond(ctx, me.idx, range, cursor).await
@@ -33,7 +33,7 @@ pub async fn get_memories(ctx: Ctx, req: Req) -> HResult {
 
 // GET /api/memories/{date} — auth user, pinned.
 pub async fn get_memories_by_date(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let date = req.param(0).to_string();
     let (range, cursor) = cursor_and_period(&req, || {
         let d = timefmt::parse_date(&date)?;

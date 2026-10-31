@@ -31,7 +31,7 @@ pub const POST_BODY_CAP: usize = 16 * 1024 * 1024 + 64 * 1024;
 
 // POST /api/posts — auth user, pinned, multipart. The JPEG is decoded BEFORE ctx.write.
 pub async fn create_post(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     // bounded buffering: a body over POST_BODY_CAP cannot hold a ≤ 4096 px JPEG we accept ⇒ invalid_post
     // (every check that could come first answers the same 400 invalid_post); the rest is drained unstored
     let Some(body) = req.bind_capped(POST_BODY_CAP).await? else { return Err(ApiError::bad_request("invalid_post")) };
@@ -98,7 +98,7 @@ pub fn exec_create_post(st: &State, tx: &mut Tx, actor: Id, image: &Blob, captio
 
 // GET /api/posts/me/current — auth user, pinned.
 pub async fn get_my_current_post(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     ctx.respond(200, |st, w| {
         let not_found = || ApiError::not_found("post_not_found");
         let c = st.open_window_of(st.user(me.idx).region).ok_or_else(not_found)?;
@@ -119,7 +119,7 @@ pub async fn get_my_current_post(ctx: Ctx, req: Req) -> HResult {
 
 // GET /api/posts/{postId} — auth user, pinned.
 pub async fn get_post(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let post_id = req.param(0);
     ctx.respond(200, |st, w| {
         let v = rules::viewer(st, me.idx);
@@ -132,7 +132,7 @@ pub async fn get_post(ctx: Ctx, req: Req) -> HResult {
 
 // PATCH /api/posts/{postId} — auth user, pinned.
 pub async fn update_post(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let post = req.param(0).to_string();
     let body = req.bind().await?;
     let caption = body.str("caption")?;
@@ -171,7 +171,7 @@ pub fn exec_update_post(st: &State, tx: &mut Tx, actor: Id, post: &str, caption:
 
 // DELETE /api/posts/{postId} — auth user, pinned.
 pub async fn delete_post(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let post = req.param(0).to_string();
     ctx.write(Command::DeletePost { actor: me.id, post }).await?;
     Ok(Resp::no_content())

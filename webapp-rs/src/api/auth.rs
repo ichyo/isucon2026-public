@@ -91,7 +91,7 @@ pub fn exec_login(st: &State, tx: &mut Tx, username: &str, secret_key: &str) -> 
 // ---------------------------------------------------------------------------------------------
 
 pub async fn logout(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_user(&req)?;
+    let me = ctx.auth_user(&req).await?;
     ctx.write(Command::Logout { token: me.token }).await?;
     Ok(Resp::no_content())
 }

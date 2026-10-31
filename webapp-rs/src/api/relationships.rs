@@ -37,7 +37,7 @@ fn ordered(a: Id, b: Id) -> (Id, Id) {
 
 /// Handler shape shared by the 204 relationship writes on `/{userId}`: auth (pinned), path param, write.
 async fn target_write(ctx: Ctx, req: Req, cmd: impl FnOnce(Id, String) -> Command) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let target = req.param(0).to_string();
     ctx.write(cmd(me.id, target)).await?;
     Ok(Resp::no_content())
@@ -55,7 +55,7 @@ async fn friend_request_response(ctx: Ctx, status: u16, request: Id) -> HResult 
 
 // POST /api/friend-requests — auth user, pinned. Body {"recipientId"}. 201 FriendRequestState.
 pub async fn create_friend_request(ctx: Ctx, mut req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let body = req.bind().await?;
     let recipient = body.str("recipientId")?.unwrap_or_default();
     let out = ctx.write(Command::CreateFriendRequest { actor: me.id, recipient }).await?;
@@ -90,7 +90,7 @@ pub fn exec_create_friend_request(st: &State, tx: &mut Tx, actor: Id, recipient:
 
 // POST /api/friend-requests/{requestId}/{action} — auth user, pinned. 200 FriendRequestState.
 pub async fn transition_friend_request(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let request = req.param(0).to_string();
     let action = req.param(1).to_string();
     let out = ctx.write(Command::TransitionFriendRequest { actor: me.id, request, action }).await?;
@@ -171,7 +171,7 @@ fn before_cursor(at: Ts, id: Id, c_at: Ts, c_id: &str) -> bool {
 // GET /api/relationships/{kind}[?beforeUpdatedAt=&beforeId=] — auth user, pinned.
 // Rows whose other user is active, ordered by (updatedAt, relationId) desc.
 pub async fn get_relationships(ctx: Ctx, req: Req) -> HResult {
-    let me = ctx.auth_pinned(&req)?;
+    let me = ctx.auth_pinned(&req).await?;
     let before_at = req.query_time("beforeUpdatedAt")?; // empty / garbage ⇒ 400 bind
     let before_id = req.query_nonempty("beforeId");
     if before_at.is_some() != before_id.is_some() {
