@@ -31,6 +31,37 @@ const CODES: [u16; 15] = [200, 201, 204, 304, 400, 401, 403, 404, 405, 409, 413,
 tokio::task_local! {
     /// (number of replicated writes, µs spent waiting for replication) of the current request
     pub static REPL_WAIT: Cell<(u64, u64)>;
+    /// per-request phase timings (µs): body receive (from request start), JPEG permit wait, JPEG decode
+    pub static PHASES: Cell<Phases>;
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Phases {
+    /// request start (headers parsed) → body fully received; None if the body was never read
+    pub body_recv_us: Option<u64>,
+    pub jpeg_n: u32,
+    pub jpeg_wait_us: u64,
+    pub jpeg_us: u64,
+}
+
+/// Records the time from request start until the body was fully received (no-op outside a request).
+pub fn set_body_recv(d: Duration) {
+    let _ = PHASES.try_with(|c| {
+        let mut p = c.get();
+        p.body_recv_us = Some(d.as_micros() as u64);
+        c.set(p);
+    });
+}
+
+/// Records one JPEG decode: time waiting for the permit + decode time.
+pub fn add_jpeg(wait: Duration, decode: Duration) {
+    let _ = PHASES.try_with(|c| {
+        let mut p = c.get();
+        p.jpeg_n += 1;
+        p.jpeg_wait_us += wait.as_micros() as u64;
+        p.jpeg_us += decode.as_micros() as u64;
+        c.set(p);
+    });
 }
 
 /// Adds replication wait time to the current request (no-op outside a request scope).
@@ -129,6 +160,9 @@ struct ActionStats {
     codes: [AtomicU64; CODES.len() + 1],
     lat: Hist,
     repl: Hist,
+    body_recv: Hist,
+    jpeg_wait: Hist,
+    jpeg: Hist,
     req_bytes: AtomicU64,
     resp_bytes: AtomicU64,
     /// requests whose body the handler left (partly) unread and the HTTP layer drained before responding
@@ -146,6 +180,9 @@ impl ActionStats {
             codes: std::array::from_fn(|_| AtomicU64::new(0)),
             lat: Hist::new(),
             repl: Hist::new(),
+            body_recv: Hist::new(),
+            jpeg_wait: Hist::new(),
+            jpeg: Hist::new(),
             req_bytes: AtomicU64::new(0),
             resp_bytes: AtomicU64::new(0),
             drained: AtomicU64::new(0),
@@ -160,6 +197,9 @@ impl ActionStats {
         }
         self.lat.reset();
         self.repl.reset();
+        self.body_recv.reset();
+        self.jpeg_wait.reset();
+        self.jpeg.reset();
         self.req_bytes.store(0, Relaxed);
         self.resp_bytes.store(0, Relaxed);
         self.drained.store(0, Relaxed);
@@ -255,6 +295,19 @@ impl Metrics {
         s.per[action].fetch_add(1, Relaxed);
     }
 
+    /// Records the phase breakdown of one finished request.
+    #[inline]
+    pub fn record_phases(&self, action: usize, p: Phases) {
+        let Some(a) = self.actions.get(action) else { return };
+        if let Some(us) = p.body_recv_us {
+            a.body_recv.add(us);
+        }
+        if p.jpeg_n > 0 {
+            a.jpeg_wait.add(p.jpeg_wait_us);
+            a.jpeg.add(p.jpeg_us);
+        }
+    }
+
     /// Records what happened to the unread rest of a request body.
     #[inline]
     pub fn record_drain(&self, action: usize, d: crate::http::req::Drain) {
@@ -338,6 +391,13 @@ impl Metrics {
             });
             if a.repl.n.load(Relaxed) > 0 {
                 v["repl_wait"] = a.repl.json();
+            }
+            if a.body_recv.n.load(Relaxed) > 0 {
+                v["body_recv"] = a.body_recv.json();
+            }
+            if a.jpeg.n.load(Relaxed) > 0 {
+                v["jpeg_wait"] = a.jpeg_wait.json();
+                v["jpeg"] = a.jpeg.json();
             }
             acts.push((lat_sum, v));
         }

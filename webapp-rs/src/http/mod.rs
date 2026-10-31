@@ -128,13 +128,17 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     ip: ip.clone(),
                     start,
                 };
-                let (result, rw) = metrics::REPL_WAIT
-                    .scope(std::cell::Cell::new((0, 0)), async move {
-                        let res = (route.handler)(app, r).await;
-                        (res, metrics::REPL_WAIT.with(|c| c.get()))
-                    })
+                let (result, rw, ph) = metrics::REPL_WAIT
+                    .scope(
+                        std::cell::Cell::new((0, 0)),
+                        metrics::PHASES.scope(std::cell::Cell::new(metrics::Phases::default()), async move {
+                            let res = (route.handler)(app, r).await;
+                            (res, metrics::REPL_WAIT.with(|c| c.get()), metrics::PHASES.with(|c| c.get()))
+                        }),
+                    )
                     .await;
                 repl = rw;
+                app.metrics.record_phases(action_id, ph);
                 match result {
                     Ok(r) => r,
                     Err(e) => {
