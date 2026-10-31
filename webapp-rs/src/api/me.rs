@@ -54,9 +54,6 @@ pub fn exec_update_profile(st: &State, tx: &mut Tx, user: Id, display_name: Opti
     Ok(Outcome::Unit)
 }
 
-/// Max buffered profile-image body.
-pub const PROFILE_IMAGE_BODY_CAP: usize = 4 * 1024 * 1024;
-
 // PUT /api/me/profile-image — auth user, not pinned. Content-Type must be exactly `image/jpeg` (415), raw
 // body = JPEG: undecodable ⇒ 400 + abuse InvalidImage; > 512 px ⇒ 400 (not abuse). 204.
 pub async fn put_profile_image(ctx: Ctx, mut req: Req) -> HResult {
@@ -64,13 +61,8 @@ pub async fn put_profile_image(ctx: Ctx, mut req: Req) -> HResult {
     if req.header("content-type") != Some("image/jpeg") {
         return Err(ApiError::new(415, "unsupported_media_type"));
     }
+    let image = req.body_bytes().await?;
     let invalid = || ApiError::bad_request("invalid_profile_image");
-    // bounded buffering: not starting with a JPEG SOI + marker (FF D8 FF), or over 4 MiB (a ≤ 512 px JPEG is far
-    // smaller) ⇒ undecodable: 400 + abuse, the rest of the body is drained without being stored
-    let image = match req.body_capped(PROFILE_IMAGE_BODY_CAP, Some(&[0xFF, 0xD8, 0xFF])).await? {
-        crate::http::req::Capped::Body(b) => b,
-        crate::http::req::Capped::Rejected => return Err(invalid().abuse(Abuse::InvalidImage)),
-    };
     // full decode in the blocking pool, before (and outside) the write path
     let dims = jpeg::decode(image.clone()).await.ok_or_else(|| invalid().abuse(Abuse::InvalidImage))?;
     if dims.width > PROFILE_IMAGE_MAX || dims.height > PROFILE_IMAGE_MAX {

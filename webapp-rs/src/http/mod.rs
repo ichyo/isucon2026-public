@@ -35,37 +35,8 @@ pub async fn serve(app: &'static App, listener: TcpListener) {
         let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| handle(app, req, peer));
-            // no header-read / idle / body timeouts: slow uploads through the router can take tens of seconds, and
-            // idle keep-alive connections are never closed by us
-            let conn = hyper::server::conn::http1::Builder::new()
-                .keep_alive(true)
-                .header_read_timeout(None)
-                .serve_connection(TokioIo::new(stream), svc)
-                .without_shutdown();
-            if let Ok(parts) = conn.await {
-                lingering_close(parts.io.into_inner()).await;
-            }
+            let _ = hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(stream), svc).await;
         });
-    }
-}
-
-/// nginx-style lingering close: send FIN after the (flushed) response, then read and discard whatever the peer
-/// still sends for at most `LINGER` (or until it closes), and only then close — closing a socket with unread
-/// data would send an RST that can destroy the response before the client has read it.
-pub const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
-
-async fn lingering_close(mut s: tokio::net::TcpStream) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    if s.shutdown().await.is_err() {
-        return;
-    }
-    let deadline = tokio::time::Instant::now() + LINGER;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        match tokio::time::timeout_at(deadline, s.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => continue,
-            _ => return,
-        }
     }
 }
 
@@ -84,7 +55,6 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     let start = Instant::now();
     let ip = client_ip(&req, peer);
     let (parts, body) = req.into_parts();
-    let body: req::BodySlot = std::sync::Arc::new(parking_lot::Mutex::new(Some(body)));
     let path = parts.uri.path().to_string();
     let kind = throttle::kind_of(&path);
     let mut action = "-";
@@ -99,7 +69,7 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|n| n > MAX_BODY as u64);
 
-    let mut resp: Resp = if parts.headers.contains_key(HEALTH_HEADER) && path == "/" {
+    let resp: Resp = if parts.headers.contains_key(HEALTH_HEADER) && path == "/" {
         // load-balancer health check (HAProxy on asia1): 200 only while this node may serve reads
         action_id = metrics::A_HEALTH;
         if follower_in_sync_now(app) {
@@ -147,23 +117,18 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     params,
                     query: parts.uri.query().map(|s| s.to_string()),
                     headers: parts.headers,
-                    body: body.clone(),
+                    body: Some(body),
                     body_bytes: None,
                     ip: ip.clone(),
                     start,
-                    budget: None,
                 };
-                let (result, rw, ph) = metrics::REPL_WAIT
-                    .scope(
-                        std::cell::Cell::new((0, 0)),
-                        metrics::PHASES.scope(std::cell::Cell::new(metrics::Phases::default()), async move {
-                            let res = (route.handler)(app, r).await;
-                            (res, metrics::REPL_WAIT.with(|c| c.get()), metrics::PHASES.with(|c| c.get()))
-                        }),
-                    )
+                let (result, rw) = metrics::REPL_WAIT
+                    .scope(std::cell::Cell::new((0, 0)), async move {
+                        let res = (route.handler)(app, r).await;
+                        (res, metrics::REPL_WAIT.with(|c| c.get()))
+                    })
                     .await;
                 repl = rw;
-                app.metrics.record_phases(action_id, ph);
                 match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -180,24 +145,6 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         }
     };
 
-    // A response decided while the client is still uploading (ip_banned, 413, rejected upload, 401/403/404/405/
-    // 409/503 …): a small unread rest (≤ 64 KiB, normally already in the socket buffer) is drained so the
-    // connection stays reusable; a larger one is NOT received (abusive 10–32 MB uploads would eat the router's
-    // bandwidth): the response carries `Connection: close` (the router does not reuse the connection) and the
-    // connection ends with a lingering close (FIN after the response, then unread data is discarded for ≤ 2 s
-    // before the socket is closed — never an RST before the response is delivered).
-    let drained = if req::body_pending(&body) {
-        if req_bytes > 0 && req_bytes <= req::SMALL_DRAIN as u64 {
-            req::drain(&body).await
-        } else {
-            body.lock().take();
-            resp = resp.header("connection", "close");
-            req::Drain::Failed
-        }
-    } else {
-        req::Drain::None
-    };
-    app.metrics.record_drain(action_id, drained);
     let resp_bytes = match &resp.body {
         RespBody::Full(b) => b.len() as u64,
         _ => 0,

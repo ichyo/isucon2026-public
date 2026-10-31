@@ -63,8 +63,6 @@ pub struct Config {
     /// ISUREAL_JPEG_CONCURRENCY / ISUREAL_SIGN_CONCURRENCY (0 = number of CPUs)
     pub jpeg_concurrency: usize,
     pub sign_concurrency: usize,
-    /// ISUREAL_BODY_BUDGET_MB: global budget for buffered request bodies (requests wait beyond it)
-    pub body_budget_mb: u64,
 }
 
 /// Upper bound for ISUREAL_GATE_SILENCE_MS (the leader drops a silent follower after 25 s and only then acks
@@ -178,7 +176,6 @@ impl Config {
             },
             jpeg_concurrency: num("ISUREAL_JPEG_CONCURRENCY", 0)? as usize,
             sign_concurrency: num("ISUREAL_SIGN_CONCURRENCY", 0)? as usize,
-            body_budget_mb: num("ISUREAL_BODY_BUDGET_MB", 600)?,
         })
     }
 
@@ -209,7 +206,6 @@ impl Config {
             gate_silence_ms: 2_000,
             jpeg_concurrency: 0,
             sign_concurrency: 0,
-            body_budget_mb: 600,
         }
     }
 

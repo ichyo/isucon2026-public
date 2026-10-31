@@ -114,7 +114,6 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
                 a.extend(b);
             }
             v["signatures"] = sigs;
-            v["memory"] = memory_json();
             text(200, v.to_string())
         }
         ("POST", "/metrics/reset") => {
@@ -148,34 +147,6 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
         _ => text(404, "{\"error\":\"Not Found\"}".into()),
     };
     Ok(resp)
-}
-
-/// Process memory + buffered request bodies (`/metrics` → `memory`).
-pub fn memory_json() -> serde_json::Value {
-    use crate::http::req::*;
-    use std::sync::atomic::Ordering::Relaxed;
-    // current RSS (Linux: /proc/self/statm resident pages); max RSS from getrusage
-    let rss = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
-        .map(|pages| pages * 4096);
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: plain syscall filling a caller-owned struct.
-    let max_rss = if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
-        // Linux: KiB; macOS: bytes
-        if cfg!(target_os = "linux") { ru.ru_maxrss as u64 * 1024 } else { ru.ru_maxrss as u64 }
-    } else {
-        0
-    };
-    serde_json::json!({
-        "rss_bytes": rss,
-        "max_rss_bytes": max_rss,
-        "body_buffered_bytes": BODY_BYTES_IN_USE.load(Relaxed),
-        "body_buffered_peak_bytes": BODY_BYTES_PEAK.load(Relaxed),
-        "body_budget_bytes": budget_kib() * 1024,
-        "body_budget_waits": BODY_BUDGET_WAITS.load(Relaxed),
-        "body_rejected_unbuffered": BODY_REJECTED.load(Relaxed),
-    })
 }
 
 /// Runs the control server (127.0.0.1 only by default).
