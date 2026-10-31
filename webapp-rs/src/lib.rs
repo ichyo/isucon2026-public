@@ -18,6 +18,7 @@ pub mod model;
 pub mod repl;
 pub mod rules;
 pub mod server;
+pub mod sha256mb;
 pub mod sign;
 pub mod sse;
 pub mod state;

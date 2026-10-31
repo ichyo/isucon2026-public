@@ -1,6 +1,8 @@
 //! Image URL signatures (§5.2): `sig = b64url_nopad(HMAC^1000(key, "{exp}:{imageId}"))` + cache.
 //! Signing semantics follow the reference `webapp/rust/src/image_signature.rs`; iterations 2..1000 use a
-//! hand-rolled HMAC over pre-keyed SHA-256 states (exactly 2 compressions per iteration).
+//! hand-rolled HMAC over pre-keyed SHA-256 states (exactly 2 compressions per iteration). Batches (`sign_many`)
+//! run on the multi-buffer SIMD backend picked by `sha256mb::Backend::get()` (AVX-512 / AVX2 on CPUs without
+//! SHA-NI) and are split over the available cores.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -11,6 +13,7 @@ use sha2::digest::generic_array::GenericArray;
 use sha2::Sha256;
 
 use crate::model::Id;
+use crate::sha256mb::{self, Backend};
 
 pub const ITERATIONS: usize = 1000;
 pub const URL_LIFETIME_S: i64 = 86400;
@@ -46,14 +49,19 @@ fn compress_32(state: &[u32; 8], msg: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Computes the raw 32-byte signature (uncached).
-pub fn compute(key: &[u8; 32], image: Id, exp: i64) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key");
+/// The signed message `"{exp}:{imageId}"`.
+fn message(image: Id, exp: i64) -> Vec<u8> {
     let mut msg = Vec::with_capacity(64);
     msg.extend_from_slice(exp.to_string().as_bytes());
     msg.push(b':');
     image.write_to(&mut msg);
-    mac.update(&msg);
+    msg
+}
+
+/// Computes the raw 32-byte signature (uncached).
+pub fn compute(key: &[u8; 32], image: Id, exp: i64) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key");
+    mac.update(&message(image, exp));
     let mut v: [u8; 32] = mac.finalize().into_bytes().into();
     let inner = keyed_state(key, 0x36);
     let outer = keyed_state(key, 0x5c);
@@ -62,6 +70,56 @@ pub fn compute(key: &[u8; 32], image: Id, exp: i64) -> [u8; 32] {
         v = compress_32(&outer, &ih);
     }
     v
+}
+
+/// Raw signatures (uncached) of `(image, key)` jobs for one `exp`, on the calling thread. `Scalar` is `compute`
+/// per job; a SIMD backend computes `backend.lanes()` signatures per pass (bit-identical results).
+pub fn compute_batch(backend: Backend, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
+    if backend == Backend::Scalar {
+        return jobs.iter().map(|(img, key)| compute(key, *img, exp)).collect();
+    }
+    let keys: Vec<[u8; 32]> = jobs.iter().map(|j| j.1).collect();
+    let msgs: Vec<Vec<u8>> = jobs.iter().map(|(img, _)| message(*img, exp)).collect();
+    let refs: Vec<&[u8]> = msgs.iter().map(|m| &m[..]).collect();
+    let mut out = vec![[0u8; 32]; jobs.len()];
+    sha256mb::hmac_chain(backend, &keys, &refs, ITERATIONS, &mut out);
+    out
+}
+
+/// One raw signature (uncached) on the fastest path: a 1-lane AVX-512VL pass is ~1.5x faster than scalar
+/// software SHA-256 (0.41 vs 0.61 ms on Cascade Lake); AVX2 is not, and SHA-NI machines use `Scalar`.
+pub fn compute_one(key: &[u8; 32], image: Id, exp: i64) -> [u8; 32] {
+    match Backend::get() {
+        b @ (Backend::Avx512 | Backend::Avx512Vl) => compute_batch(b, &[(image, *key)], exp)[0],
+        _ => compute(key, image, exp),
+    }
+}
+
+fn max_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// `compute_batch` split over up to `available_parallelism` threads: whole SIMD passes per thread (a batch
+/// that fits one pass stays on the calling thread); scalar: at least 4 jobs per thread.
+pub fn compute_parallel(backend: Backend, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
+    let (unit, min_units) = if backend == Backend::Scalar { (1, 4) } else { (backend.lanes(), 1) };
+    let units = jobs.len().div_ceil(unit);
+    let threads = (units / min_units).clamp(1, max_threads());
+    if threads == 1 {
+        return compute_batch(backend, jobs, exp);
+    }
+    let per = units.div_ceil(threads) * unit;
+    std::thread::scope(|s| {
+        let mut parts = jobs.chunks(per);
+        let first = parts.next().expect("non-empty");
+        let handles: Vec<_> = parts.map(|p| s.spawn(move || compute_batch(backend, p, exp))).collect();
+        let mut out = compute_batch(backend, first, exp);
+        for h in handles {
+            out.extend(h.join().expect("sign thread"));
+        }
+        out
+    })
 }
 
 pub fn encode_sig(sig: &[u8; 32]) -> [u8; SIG_LEN] {
@@ -122,7 +180,7 @@ impl Signer {
         if let Some(s) = self.cached(image, exp) {
             return s;
         }
-        let s = compute(key, image, exp);
+        let s = compute_one(key, image, exp);
         self.insert(image, exp, s);
         s
     }
@@ -138,7 +196,8 @@ impl Signer {
         ct_eq(&self.sign(key, image, exp), sig)
     }
 
-    /// Signs many (image, key) pairs for one exp; uses 2 threads when there are many misses.
+    /// Signs many (image, key) pairs for one exp; misses are computed in SIMD batches (`Backend::get()`) and
+    /// split over the available cores when there are many.
     pub fn sign_many(&self, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
         let mut out = vec![[0u8; 32]; jobs.len()];
         let mut missing: Vec<usize> = Vec::new();
@@ -164,19 +223,8 @@ impl Signer {
         if missing.is_empty() {
             return out;
         }
-        let computed: Vec<(usize, [u8; 32])> = if missing.len() >= 8 {
-            let mid = missing.len() / 2;
-            let (a, b) = missing.split_at(mid);
-            std::thread::scope(|s| {
-                let h = s.spawn(|| a.iter().map(|&i| (i, compute(&jobs[i].1, jobs[i].0, exp))).collect::<Vec<_>>());
-                let mut rb: Vec<_> = b.iter().map(|&i| (i, compute(&jobs[i].1, jobs[i].0, exp))).collect();
-                let mut ra = h.join().expect("sign thread");
-                ra.append(&mut rb);
-                ra
-            })
-        } else {
-            missing.iter().map(|&i| (i, compute(&jobs[i].1, jobs[i].0, exp))).collect()
-        };
+        let todo: Vec<(Id, [u8; 32])> = missing.iter().map(|&i| jobs[i]).collect();
+        let computed = missing.iter().copied().zip(compute_parallel(Backend::get(), &todo, exp));
         let mut c = self.cache.lock();
         for (i, s) in computed {
             out[i] = s;
@@ -251,5 +299,52 @@ mod tests {
             assert_eq!(r[i], compute(k, *img, 99));
         }
         assert_eq!(s.len(), 10 + 1 + 8);
+    }
+
+    /// Every backend this CPU supports gives `compute`'s bytes, for batch sizes 1..=17 (partial, full and
+    /// multi-pass SIMD batches), random keys/images and exps of different lengths, plus the spec test vector.
+    #[test]
+    fn batch_backends_match_scalar() {
+        let spec_key = hex32("eb10e9f6a56989e845c41c78108cee3a3515badd12d8c87185a2f27a99c9a00f");
+        let spec_img = Id::parse("95a1b321-f2a8-4d4a-b068-4634710884b5").unwrap();
+        let spec_exp = 1793495817;
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // message lengths 39..57 bytes: one and two SHA blocks
+        let exps = [spec_exp, 99, -5, 1_000_000_000_000_000_000, i64::MIN];
+        for b in Backend::ALL.into_iter().filter(|b| b.is_supported()) {
+            for n in 1..=17usize {
+                let exp = exps[n % exps.len()];
+                let jobs: Vec<(Id, [u8; 32])> = (0..n)
+                    .map(|i| {
+                        if exp == spec_exp && i == n / 2 {
+                            return (spec_img, spec_key);
+                        }
+                        let mut k = [0u8; 32];
+                        k.iter_mut().for_each(|x| *x = rnd() as u8);
+                        (Id::from_u128(((rnd() as u128) << 64) | rnd() as u128), k)
+                    })
+                    .collect();
+                let got = compute_batch(b, &jobs, exp);
+                let par = compute_parallel(b, &jobs, exp);
+                for (i, (img, k)) in jobs.iter().enumerate() {
+                    let want = compute(k, *img, exp);
+                    assert_eq!(got[i], want, "{b:?} n={n} i={i} exp={exp}");
+                    assert_eq!(par[i], want, "{b:?} parallel n={n} i={i} exp={exp}");
+                }
+                let (img, k) = jobs[0];
+                assert_eq!(compute_one(&k, img, exp), compute(&k, img, exp));
+                assert_eq!(Signer::new(1).sign(&k, img, exp), compute(&k, img, exp));
+                if exp == spec_exp {
+                    let sig = encode_sig(&got[n / 2]);
+                    assert_eq!(std::str::from_utf8(&sig).unwrap(), "Eu9_AZHks4gcdTAtvh37qqurEHf3vZNkKUVVlRVsWFk");
+                }
+            }
+        }
     }
 }
