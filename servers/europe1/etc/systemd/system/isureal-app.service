@@ -1,0 +1,20 @@
+[Unit]
+Description=isureal (rust, in-memory replicated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/app
+EnvironmentFile=/home/isucon/env.sh
+EnvironmentFile=-/home/isucon/app/app.env
+ExecStart=/home/isucon/app/isureal
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=1048576
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
