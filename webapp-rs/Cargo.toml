@@ -33,6 +33,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 libc = "0.2"
+memchr = "2"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 multer = "3"
@@ -50,6 +51,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 gen-testdata = { path = "tools/gen-testdata" }
+jpeg-encoder = "0.6"
 
 [profile.release]
 lto = "fat"
