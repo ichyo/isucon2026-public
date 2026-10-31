@@ -2,3 +2,4 @@ target/
 *.log
 /tmp/
 .DS_Store
+results/**/*.log.gz
