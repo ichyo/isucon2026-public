@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use super::proto::{self, Ack, Forward, Hello, Reset, ResponseMsg};
 use super::Origin;
 use crate::app::{App, WaitPolicy};
+use crate::config::AckMode;
 use crate::apply::apply;
 use crate::command::{self, Blob, Command, Outcome, Tx};
 use crate::entry::{encode_record, BlobOut};
@@ -54,6 +55,8 @@ pub struct Link {
     max_ack_us: AtomicU64,
     slow_acks: AtomicU64,
     last_warn_us: AtomicU64,
+    /// max (leader seq − acked seq) observed (follower lag in records)
+    max_lag: AtomicU64,
     connected_at: Instant,
 }
 
@@ -73,6 +76,14 @@ impl Link {
     }
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
+    }
+    fn lag(&self, epoch: u64, leader_seq: u64) -> u64 {
+        let (e, s) = *self.acked.borrow();
+        if e == epoch {
+            leader_seq.saturating_sub(s)
+        } else {
+            leader_seq
+        }
     }
     fn on_ack(&self, a: Ack) {
         self.acked.send_replace((a.epoch, a.seq));
@@ -134,6 +145,8 @@ impl Link {
 
 pub struct Leader {
     links: Mutex<Vec<Arc<Link>>>,
+    /// (epoch, last seq) of the log, for lag metrics
+    head: Mutex<(u64, u64)>,
     next_link: AtomicU64,
     init_lock: tokio::sync::Mutex<()>,
 }
@@ -146,7 +159,7 @@ impl Default for Leader {
 
 impl Leader {
     pub fn new() -> Leader {
-        Leader { links: Mutex::new(Vec::new()), next_link: AtomicU64::new(1), init_lock: tokio::sync::Mutex::new(()) }
+        Leader { links: Mutex::new(Vec::new()), head: Mutex::new((0, 0)), next_link: AtomicU64::new(1), init_lock: tokio::sync::Mutex::new(()) }
     }
 
     /// Executes a command and replicates its entries. Pipelined: the lock is released before waiting.
@@ -203,6 +216,17 @@ impl Leader {
             }
             for (i, link) in links.iter().enumerate() {
                 link.send(proto::frame(proto::RECORDS, &payloads[i]));
+                link.max_lag.fetch_max(link.lag(wal.epoch, wal.last_seq), Ordering::Relaxed);
+            }
+            *self.head.lock() = (wal.epoch, wal.last_seq);
+            // ACK_MODE=direct: the origin follower gets the outcome right behind the records and completes its
+            // client once it has direct acks from every node this leader waits for (it falls back to RESPONSE)
+            if let (Origin::Link { link: lid, req_id }, AckMode::Direct, WaitPolicy::AllReplicas) = (origin, app.cfg.ack_mode, policy) {
+                if let Some(o) = links.iter().find(|l| l.id == lid) {
+                    let wait_for: Vec<NodeId> = links.iter().filter(|l| l.id != lid && !l.is_dead()).map(|l| l.node).collect();
+                    let early = proto::Early { req_id, outcome: outcome.clone(), epoch: wal.epoch, seq: wal.last_seq, wait_for };
+                    o.send(proto::frame_msg(proto::EARLY, &early));
+                }
             }
             app.handle_effects(&st, &fx);
             (outcome, wal.epoch, wal.last_seq, lsn, links)
@@ -233,6 +257,7 @@ impl Leader {
                 epoch = rand_u64();
             }
             app.wal.reset(&mut wal, epoch).map_err(|e| ApiError::internal(format!("wal reset: {e}")))?;
+            *self.head.lock() = (epoch, 0);
             let old = app.swap_state(&mut st, fresh);
             app.images.reset_uploads_for_epoch(epoch);
             let links: Vec<Arc<Link>> = self.links.lock().clone();
@@ -254,6 +279,32 @@ impl Leader {
         Ok(())
     }
 
+    /// Clears the per-link maxima (`POST /metrics/reset`).
+    pub fn reset_stats(&self) {
+        for l in self.links.lock().iter() {
+            l.max_ack_us.store(0, Ordering::Relaxed);
+            l.slow_acks.store(0, Ordering::Relaxed);
+            l.max_lag.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Per-follower replication metrics for /metrics.
+    pub fn metrics_json(&self) -> serde_json::Value {
+        let (epoch, head) = *self.head.lock();
+        let links = self.links.lock();
+        serde_json::json!({
+            "head_seq": head,
+            "followers": links.iter().map(|l| serde_json::json!({
+                "node": l.node.name(),
+                "lag_now": l.lag(epoch, head),
+                "max_lag": l.max_lag.load(Ordering::Relaxed),
+                "max_ack_ms": l.max_ack_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                "slow_acks": l.slow_acks.load(Ordering::Relaxed),
+                "queue_bytes": l.queue_bytes.load(Ordering::Relaxed),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     pub fn status_json(&self) -> String {
         let links = self.links.lock();
         let v: Vec<String> = links
@@ -261,7 +312,7 @@ impl Leader {
             .map(|l| {
                 let (e, s) = *l.acked.borrow();
                 format!(
-                    "{{\"id\":{},\"node\":\"{}\",\"caught_up\":{},\"acked_epoch\":{},\"acked_seq\":{},\"queue_bytes\":{},\"max_ack_ms\":{:.1},\"slow_acks\":{},\"connected_s\":{}}}",
+                    "{{\"id\":{},\"node\":\"{}\",\"caught_up\":{},\"acked_epoch\":{},\"acked_seq\":{},\"queue_bytes\":{},\"max_ack_ms\":{:.1},\"slow_acks\":{},\"max_lag\":{},\"connected_s\":{}}}",
                     l.id,
                     l.node.name(),
                     l.in_sync.load(Ordering::SeqCst),
@@ -270,6 +321,7 @@ impl Leader {
                     l.queue_bytes.load(Ordering::Relaxed),
                     l.max_ack_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     l.slow_acks.load(Ordering::Relaxed),
+                    l.max_lag.load(Ordering::Relaxed),
                     l.connected_at.elapsed().as_secs()
                 )
             })
@@ -284,6 +336,32 @@ impl Leader {
 
 fn rand_u64() -> u64 {
     Id::new_v4().lo
+}
+
+/// ACK_MODE=direct: streams the leader's own durable seq to every follower (`LEADER_SYNCED`), so an origin
+/// follower can tell when the leader's copy of a forwarded write is persisted.
+pub async fn run_synced_broadcast(app: &'static App) {
+    let me = leader(app);
+    let mut rx = app.wal.subscribe_synced();
+    let mut last = (u64::MAX, u64::MAX);
+    loop {
+        if rx.changed().await.is_err() {
+            return;
+        }
+        let lsn = *rx.borrow_and_update();
+        let cur = {
+            let w = app.wal.inner.lock();
+            (w.epoch, crate::wal::Wal::durable_seq(&w, lsn))
+        };
+        if cur == last {
+            continue;
+        }
+        last = cur;
+        let f = proto::frame_msg(proto::LEADER_SYNCED, &Ack { epoch: cur.0, seq: cur.1 });
+        for l in me.links.lock().iter() {
+            l.send(f.clone());
+        }
+    }
 }
 
 /// Accept loop for follower connections.
@@ -383,6 +461,7 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
         max_ack_us: AtomicU64::new(0),
         slow_acks: AtomicU64::new(0),
         last_warn_us: AtomicU64::new(0),
+        max_lag: AtomicU64::new(0),
         connected_at: Instant::now(),
     });
     // plan the catch-up and register atomically w.r.t. the sequencer (wal lock): every record after `target`
@@ -458,7 +537,8 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
                     let l = rlink.clone();
                     tokio::spawn(async move {
                         let origin = Origin::Link { link: l.id, req_id: fwd.req_id };
-                        let result = leader(app).submit(app, fwd.cmd, origin, WaitPolicy::AllReplicas).await;
+                        let policy = app.policy_for(&fwd.cmd);
+                        let result = leader(app).submit(app, fwd.cmd, origin, policy).await;
                         l.send(proto::frame_msg(proto::RESPONSE, &ResponseMsg { req_id: fwd.req_id, result }));
                     });
                 }

@@ -18,6 +18,11 @@ pub const RESPONSE: u8 = 12;
 pub const CAUGHT_UP: u8 = 13;
 /// L→F when the link is idle (keeps the follower's read lease alive)
 pub const HEARTBEAT: u8 = 14;
+/// L→F (ACK_MODE=direct): outcome of a forwarded write, sent right after its records, plus the nodes whose
+/// direct acks the origin must collect before answering its client
+pub const EARLY: u8 = 15;
+/// L→F (ACK_MODE=direct): the leader's own durable seq `Ack{epoch, seq}`
+pub const LEADER_SYNCED: u8 = 16;
 
 pub const MAX_FRAME: usize = 96 << 20;
 
@@ -46,6 +51,16 @@ pub struct Ack {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Reset {
     pub epoch: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Early {
+    pub req_id: u64,
+    pub outcome: Outcome,
+    pub epoch: u64,
+    pub seq: u64,
+    /// followers (other than the origin) the leader waits for; the leader itself is implied
+    pub wait_for: Vec<NodeId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

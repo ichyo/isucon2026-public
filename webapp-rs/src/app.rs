@@ -153,7 +153,18 @@ impl App {
     /// The write path (docs/design.md §3): leader executes + replicates; followers dry-run locally and
     /// forward to the leader. Returns after the entries are applied locally (and on all in-sync replicas).
     pub async fn write(&'static self, cmd: Command) -> Result<Outcome, ApiError> {
-        self.write_with(cmd, WaitPolicy::AllReplicas).await
+        let policy = self.policy_for(&cmd);
+        self.write_with(cmd, policy).await
+    }
+
+    /// `LeaderOnly` for the additive actions listed in ISUREAL_ASYNC_ACTIONS, else `AllReplicas`. Decided by
+    /// the leader for forwarded commands (its config is authoritative).
+    pub fn policy_for(&self, cmd: &Command) -> WaitPolicy {
+        if !self.cfg.async_actions.is_empty() && self.cfg.async_actions.contains(&cmd.name()) {
+            WaitPolicy::LeaderOnly
+        } else {
+            WaitPolicy::AllReplicas
+        }
     }
 
     pub async fn write_with(&'static self, mut cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {

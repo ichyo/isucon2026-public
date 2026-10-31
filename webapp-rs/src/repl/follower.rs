@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::proto::{self, Ack, Forward, Hello, Reset, ResponseMsg};
+use super::proto::{self, Ack, Early, Forward, Hello, Reset, ResponseMsg};
 use crate::app::App;
 use crate::apply::apply;
 use crate::command::{Blob, Command, Outcome};
@@ -29,6 +29,8 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 pub const LEASE: Duration = Duration::from_millis(2000);
 /// How long an API request waits for the follower to become in sync before answering 503.
 pub const SYNC_WAIT: Duration = Duration::from_secs(3);
+/// ACK_MODE=direct: how long the origin waits for direct acks before relying on the leader's RESPONSE.
+pub const DIRECT_WAIT: Duration = Duration::from_secs(2);
 
 fn mono_us() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -53,6 +55,10 @@ pub struct Follower {
     reconnects: AtomicU64,
     gate_waits: AtomicU64,
     gate_503: AtomicU64,
+    /// ACK_MODE=direct: forwarded writes completed from direct acks / left to the leader's RESPONSE
+    early_done: AtomicU64,
+    early_fallback: AtomicU64,
+    early_wait_us: AtomicU64,
 }
 
 impl Follower {
@@ -120,7 +126,7 @@ impl Follower {
 
     pub fn status_json(&self) -> String {
         format!(
-            "{{\"connected\":{},\"caught_up\":{},\"resetting\":{},\"in_sync\":{},\"last_frame_ms_ago\":{:.1},\"pending_forwards\":{},\"reconnects\":{},\"gate_waits\":{},\"gate_503\":{}}}",
+            "{{\"connected\":{},\"caught_up\":{},\"resetting\":{},\"in_sync\":{},\"last_frame_ms_ago\":{:.1},\"pending_forwards\":{},\"reconnects\":{},\"gate_waits\":{},\"gate_503\":{},\"direct_done\":{},\"direct_fallback\":{},\"direct_avg_ms\":{:.1}}}",
             self.is_connected(),
             self.caught_up.load(Ordering::SeqCst),
             self.resetting.load(Ordering::SeqCst),
@@ -129,7 +135,13 @@ impl Follower {
             self.pending.lock().len(),
             self.reconnects.load(Ordering::Relaxed),
             self.gate_waits.load(Ordering::Relaxed),
-            self.gate_503.load(Ordering::Relaxed)
+            self.gate_503.load(Ordering::Relaxed),
+            self.early_done.load(Ordering::Relaxed),
+            self.early_fallback.load(Ordering::Relaxed),
+            {
+                let n = self.early_done.load(Ordering::Relaxed);
+                if n == 0 { 0.0 } else { self.early_wait_us.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0 }
+            }
         )
     }
 
@@ -207,13 +219,18 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
     f.touch();
     f.connected.store(true, Ordering::SeqCst);
 
-    // acker: cumulative ACK after the local fsync covering the applied records
+    // acker: cumulative ACK after the local fsync covering the applied records (to the leader, and in
+    // ACK_MODE=direct also to every other follower)
     let (applied_tx, mut applied_rx) = watch::channel((epoch, seq, lsn));
     let ack_tx = tx.clone();
+    let direct = app.cfg.ack_mode == crate::config::AckMode::Direct;
     let acker = tokio::spawn(async move {
         while applied_rx.changed().await.is_ok() {
             let (e, s, l) = *applied_rx.borrow_and_update();
             app.wal.wait_synced(l).await;
+            if direct {
+                app.images.net.my_ack.send_replace((e, s));
+            }
             if ack_tx.send(proto::frame_msg(proto::ACK, &Ack { epoch: e, seq: s })).is_err() {
                 break;
             }
@@ -226,6 +243,36 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
             f.touch();
             match ty {
                 proto::HEARTBEAT => {}
+                proto::LEADER_SYNCED => {
+                    let a: Ack = proto::decode(&payload)?;
+                    app.images.net.peer_acks[app.cfg.leader_node.idx()].send_replace((a.epoch, a.seq));
+                }
+                proto::EARLY => {
+                    // the records of this write precede this frame on the connection: already applied here
+                    let m: Early = proto::decode(&payload)?;
+                    let lsn = app.wal.inner.lock().lsn;
+                    let t0 = Instant::now();
+                    tokio::spawn(async move {
+                        let net = &app.images.net;
+                        let all = async {
+                            app.wal.wait_synced(lsn).await;
+                            net.wait_peer_ack(app.cfg.leader_node, m.epoch, m.seq).await;
+                            for n in m.wait_for.iter().filter(|&&n| n != app.cfg.node) {
+                                net.wait_peer_ack(*n, m.epoch, m.seq).await;
+                            }
+                        };
+                        if tokio::time::timeout(DIRECT_WAIT, all).await.is_ok() {
+                            if let Some(p) = f.pending.lock().remove(&m.req_id) {
+                                f.early_done.fetch_add(1, Ordering::Relaxed);
+                                f.early_wait_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                let _ = p.tx.send(Ok(m.outcome));
+                            }
+                        } else {
+                            // membership / acks uncertain: the leader's RESPONSE (all acked) completes it
+                            f.early_fallback.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
                 proto::RESET => {
                     let r: Reset = proto::decode(&payload)?;
                     f.resetting.store(true, Ordering::SeqCst);

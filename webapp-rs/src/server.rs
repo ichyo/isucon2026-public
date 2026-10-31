@@ -74,6 +74,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         "[start] blobs: listen={} peers={:?} inline_max={} bytes (larger uploads stay on their origin node)",
         cfg.blob_listen, cfg.blob_peers, cfg.blob_inline_max
     );
+    eprintln!("[start] replication: ack_mode={:?} async_actions={:?}", cfg.ack_mode, cfg.async_actions);
     eprintln!("[start] throttle: ms={} feed_ms={} (change: curl -XPOST '{}/throttle?ms=N&feed_ms=M')", cfg.throttle_ms, cfg.throttle_feed_ms, cfg.control_listen);
 
     let dir = cfg.initial_dir.clone();
@@ -133,9 +134,17 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
             let l = TcpListener::bind(&app.cfg.repl_listen).await.with_context(|| format!("bind repl {}", app.cfg.repl_listen))?;
             repl_addr = Some(l.local_addr()?);
             tokio::spawn(repl::leader::serve(app, l));
+            if app.cfg.ack_mode == crate::config::AckMode::Direct {
+                tokio::spawn(repl::leader::run_synced_broadcast(app));
+            }
         }
         Repl::Follower(_) => {
             tokio::spawn(repl::follower::run(app));
+            if app.cfg.ack_mode == crate::config::AckMode::Direct {
+                // direct acks go to every other follower (the leader gets its ACK over the link)
+                let peers: Vec<_> = crate::model::NodeId::ALL.into_iter().filter(|&n| n != app.cfg.node && n != app.cfg.leader_node).collect();
+                app.images.net.spawn_ack_broadcast(app.cfg.node, peers);
+            }
         }
     }
 

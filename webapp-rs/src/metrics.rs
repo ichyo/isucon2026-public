@@ -266,6 +266,11 @@ impl Metrics {
     }
 
     pub fn json(&self, node: &str, role: &str) -> String {
+        self.json_with(node, role, Value::Null)
+    }
+
+    /// `extra` is reported as `"replication"` (leader: per-follower lag / ack latency; follower: direct-ack stats).
+    pub fn json_with(&self, node: &str, role: &str, extra: Value) -> String {
         let now = unix_s();
         let mut acts: Vec<(u64, Value)> = Vec::new();
         let (mut total_n, mut total_us) = (0u64, 0u64);
@@ -337,6 +342,7 @@ impl Metrics {
             "uptime_s": self.started.elapsed().as_secs(),
             "since_reset_s": now.saturating_sub(self.reset_at.load(Relaxed)),
             "total": {"count": total_n, "latency_sum_ms": ms(total_us)},
+            "replication": extra,
             "actions": acts.into_iter().map(|x| x.1).collect::<Vec<_>>(),
             "timeline": {
                 "actions": top.iter().map(|&i| self.names[i]).collect::<Vec<_>>(),

@@ -294,6 +294,8 @@ impl BlobCache {
 const REQ_GET: u8 = 1;
 const RESP_OK: u8 = 2;
 const RESP_ERR: u8 = 3;
+/// node-to-node cumulative ack broadcast (ACK_MODE=direct): `[u8 node][u64 epoch][u64 seq]`, no response
+const ACK_BCAST: u8 = 4;
 
 type FetchResult = Result<Bytes, String>;
 
@@ -324,6 +326,12 @@ pub struct BlobNet {
     inflight: Mutex<FxHashMap<Id, Vec<oneshot::Sender<FetchResult>>>>,
     next_req: AtomicU64,
     pub stats: NetStats,
+    /// latest (epoch, seq) applied + persisted by each node, as broadcast by that node (ACK_MODE=direct;
+    /// the leader's comes over the replication link as LEADER_SYNCED)
+    pub peer_acks: [watch::Sender<(u64, u64)>; NodeId::COUNT],
+    /// this node's own cumulative ack, pushed to the per-peer broadcast tasks
+    pub my_ack: watch::Sender<(u64, u64)>,
+    pub ack_bcasts_received: AtomicU64,
 }
 
 impl BlobNet {
@@ -334,7 +342,44 @@ impl BlobNet {
             inflight: Mutex::new(FxHashMap::default()),
             next_req: AtomicU64::new(1),
             stats: NetStats::default(),
+            peer_acks: std::array::from_fn(|_| watch::channel((0, 0)).0),
+            my_ack: watch::channel((0, 0)).0,
+            ack_bcasts_received: AtomicU64::new(0),
         }
+    }
+
+    /// ACK_MODE=direct: one task per peer pushes this node's latest cumulative ack to it (coalesced; reconnects
+    /// lazily over the blob-service connection).
+    pub fn spawn_ack_broadcast(&'static self, me: NodeId, peers: Vec<NodeId>) {
+        for peer in peers {
+            let mut rx = self.my_ack.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                    let (epoch, seq) = *rx.borrow_and_update();
+                    let mut p = Vec::with_capacity(17);
+                    p.push(me.0);
+                    p.extend_from_slice(&epoch.to_le_bytes());
+                    p.extend_from_slice(&seq.to_le_bytes());
+                    match self.conn(peer).await {
+                        Ok(c) => {
+                            if c.tx.send(proto::frame(ACK_BCAST, &p)).is_err() {
+                                c.dead.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    }
+                }
+            });
+        }
+    }
+
+    /// Waits until `node` has (directly) acked `(epoch, seq)`.
+    pub async fn wait_peer_ack(&self, node: NodeId, epoch: u64, seq: u64) {
+        let mut rx = self.peer_acks[node.idx()].subscribe();
+        let _ = rx.wait_for(|&(e, s)| e == epoch && s >= seq).await;
     }
 
     /// Changes a peer address (tests / local clusters with ephemeral ports).
@@ -532,6 +577,19 @@ pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, listener: T
             let writer = tokio::spawn(proto::writer_loop(wr, rx));
             loop {
                 let Ok((ty, p)) = proto::read_frame(&mut rd).await else { break };
+                if ty == ACK_BCAST && p.len() == 17 {
+                    if let Some(n) = NodeId::from_u8(p[0]) {
+                        let epoch = u64::from_le_bytes(p[1..9].try_into().unwrap());
+                        let seq = u64::from_le_bytes(p[9..17].try_into().unwrap());
+                        net.ack_bcasts_received.fetch_add(1, Ordering::Relaxed);
+                        net.peer_acks[n.idx()].send_if_modified(|v| {
+                            let newer = (epoch, seq) != *v;
+                            *v = (epoch, seq);
+                            newer
+                        });
+                    }
+                    continue;
+                }
                 if ty != REQ_GET || p.len() != 28 {
                     break;
                 }

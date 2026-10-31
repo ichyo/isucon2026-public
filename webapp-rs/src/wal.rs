@@ -23,6 +23,8 @@ pub struct WalInner {
     pub end: u64,
     /// monotonically increasing log position (never reset; used for durability waits)
     pub lsn: u64,
+    /// seq of a record = its lsn + seq_offset (within the current epoch)
+    seq_offset: i64,
     /// offsets[i] = file offset of record with seq i+1
     offsets: Vec<u64>,
     crcs: Vec<u32>,
@@ -105,7 +107,7 @@ impl Wal {
         let (synced, _) = watch::channel(0u64);
         let written = Arc::new((Mutex::new(0u64), Condvar::new()));
         let wal = Wal {
-            inner: Mutex::new(WalInner { epoch, last_seq: 0, end: HEADER_LEN, lsn: 0, offsets: Vec::new(), crcs: Vec::new() }),
+            inner: Mutex::new(WalInner { epoch, last_seq: 0, end: HEADER_LEN, lsn: 0, seq_offset: 0, offsets: Vec::new(), crcs: Vec::new() }),
             file,
             path,
             fsync,
@@ -207,6 +209,8 @@ impl Wal {
             self.file.sync_all()?;
         }
         inner.end = off;
+        // replayed records are durable; lsn 0 stands for the last replayed seq
+        inner.seq_offset = inner.last_seq as i64 - inner.lsn as i64;
         Ok(n)
     }
 
@@ -247,6 +251,7 @@ impl Wal {
         // everything before is gone; treat the current lsn as durable
         inner.lsn += 1;
         let lsn = inner.lsn;
+        inner.seq_offset = -(lsn as i64);
         if self.fsync {
             let (m, cv) = &*self.written;
             *m.lock() = lsn;
@@ -255,6 +260,19 @@ impl Wal {
             self.synced.send_replace(lsn);
         }
         Ok(())
+    }
+
+    /// Highest seq of the current epoch that is durable, given the synced lsn.
+    pub fn durable_seq(inner: &WalInner, synced_lsn: u64) -> u64 {
+        (synced_lsn as i64 + inner.seq_offset).clamp(0, inner.last_seq as i64) as u64
+    }
+
+    pub fn synced_lsn(&self) -> u64 {
+        *self.synced.borrow()
+    }
+
+    pub fn subscribe_synced(&self) -> watch::Receiver<u64> {
+        self.synced.subscribe()
     }
 
     /// Waits until everything up to `lsn` is durable.

@@ -98,9 +98,21 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             text(200, format!("{{\"ms\":{ms},\"feed_ms\":{f}}}"))
         }
         ("GET", "/status") => text(200, app.status_json()),
-        ("GET", "/metrics") => text(200, app.metrics.json(app.cfg.node.name(), if app.is_leader() { "leader" } else { "follower" })),
+        ("GET", "/metrics") => {
+            let (role, repl) = match &app.repl {
+                crate::repl::Repl::Leader(l) => ("leader", l.metrics_json()),
+                crate::repl::Repl::Follower(f) => ("follower", serde_json::from_str(&f.status_json()).unwrap_or_default()),
+            };
+            let mut repl = repl;
+            repl["ack_mode"] = serde_json::json!(format!("{:?}", app.cfg.ack_mode).to_lowercase());
+            repl["async_actions"] = serde_json::json!(app.cfg.async_actions);
+            text(200, app.metrics.json_with(app.cfg.node.name(), role, repl))
+        }
         ("POST", "/metrics/reset") => {
             app.metrics.reset();
+            if let crate::repl::Repl::Leader(l) = &app.repl {
+                l.reset_stats();
+            }
             text(200, "{\"reset\":true}".into())
         }
         ("POST", "/debug/session") => {

@@ -12,6 +12,20 @@ pub enum Role {
     Follower,
 }
 
+/// How a follower-originated write is confirmed to its client (docs/design.md §4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckMode {
+    /// the leader responds after every connected follower acked (2 RTT for a forwarded write)
+    Leader,
+    /// the origin follower completes as soon as it applied the records and every other node the leader waits
+    /// for acked them directly to it (≈1.5 RTT); falls back to the leader's response
+    Direct,
+}
+
+/// Actions that may use `WaitPolicy::LeaderOnly` (ISUREAL_ASYNC_ACTIONS): purely additive writes only.
+pub const ASYNC_CAPABLE: [&str; 8] =
+    ["create_post", "create_comment", "replace_real_moji", "create_friend_request", "follow", "register", "login", "certify_user"];
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// this server's fixed region (region pinning)
@@ -39,6 +53,21 @@ pub struct Config {
     pub fsync: bool,
     pub exp_quantum: i64,
     pub log_debug: bool,
+    /// ISUREAL_ACK_MODE=leader|direct (default leader)
+    pub ack_mode: AckMode,
+    /// ISUREAL_ASYNC_ACTIONS: actions answered after the leader's own apply + WAL only (default none)
+    pub async_actions: Vec<&'static str>,
+}
+
+fn parse_async_actions(s: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for a in s.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        match ASYNC_CAPABLE.iter().find(|&&c| c == a) {
+            Some(&c) => out.push(c),
+            None => eprintln!("[config] !!!!! ISUREAL_ASYNC_ACTIONS: {a:?} is not an additive action (allowed: {ASYNC_CAPABLE:?}); it stays synchronous !!!!!"),
+        }
+    }
+    out
 }
 
 fn env(name: &str) -> Option<String> {
@@ -122,6 +151,12 @@ impl Config {
             fsync: env("ISUREAL_FSYNC").map(|v| v != "0").unwrap_or(true),
             exp_quantum: num("ISUREAL_EXP_QUANTUM", 1)? as i64,
             log_debug: env("ISUREAL_LOG").as_deref() == Some("debug"),
+            ack_mode: match env("ISUREAL_ACK_MODE").as_deref() {
+                None | Some("leader") => AckMode::Leader,
+                Some("direct") => AckMode::Direct,
+                Some(o) => bail!("invalid ISUREAL_ACK_MODE {o:?} (leader|direct)"),
+            },
+            async_actions: parse_async_actions(&env("ISUREAL_ASYNC_ACTIONS").unwrap_or_default()),
         })
     }
 
@@ -147,6 +182,8 @@ impl Config {
             fsync: false,
             exp_quantum: 1,
             log_debug: false,
+            ack_mode: AckMode::Leader,
+            async_actions: Vec::new(),
         }
     }
 
