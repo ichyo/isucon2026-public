@@ -34,6 +34,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 libc = "0.2"
 memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
 multer = "3"
 parking_lot = "0.12"
 percent-encoding = "2"
