@@ -2,16 +2,19 @@
 //! handoff; this journal records subsequent replacements and revocations at that owner. Epoch and
 //! generation are part of the key so initialize and migration can never revive an older override.
 //!
-//! `set` is blocking: call it on a blocking worker while holding the ownership/epoch fence. It writes
-//! and (when configured) fsyncs before publishing the new value. Authentication must consult this
-//! store on every request; `identify` is only a routing hint, never proof of a valid session.
+//! `set` and `freeze` are blocking: call them on a blocking worker, without holding application state
+//! locks, then recheck the ownership/epoch fence. Concurrent updates share a disk sync and become
+//! visible only after it succeeds. Authentication reads never acquire the journal I/O lock.
+//! `identify` is only a routing hint, never proof of a valid session.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use parking_lot::{Condvar, Mutex};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::command::Command;
@@ -20,6 +23,9 @@ use crate::model::Id;
 const MAGIC: &[u8; 8] = b"ISURSES2";
 const MAX_RECORD: usize = 64 * 1024;
 const RECORD_HEADER: usize = 12;
+const MAX_BATCH: usize = 256;
+const BATCH_DELAY: Duration = Duration::from_micros(200);
+type Key = (u64, Id, u64);
 
 #[derive(Serialize, Deserialize)]
 enum Record {
@@ -37,11 +43,35 @@ enum Record {
     },
 }
 
+struct Queued {
+    ticket: u64,
+    record: Record,
+    encoded: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+pub struct Stats {
+    pub records: u64,
+    pub batches: u64,
+    pub syncs: u64,
+    pub disk_us: u64,
+    pub disk_max_us: u64,
+    pub commit_wait_us: u64,
+    pub commit_wait_max_us: u64,
+    pub failures: u64,
+}
+
 struct Inner {
-    file: File,
     values: FxHashMap<(u64, Id, u64), Option<Id>>,
     tokens: FxHashMap<(u64, Id), Id>,
-    pending: FxHashMap<(u64, Id, u64), Command>,
+    pending: FxHashMap<Key, Command>,
+    // Enqueued freezes fence later mutations immediately, but pending() exposes only durable ones.
+    freezing: FxHashSet<Key>,
+    queue: VecDeque<Queued>,
+    enqueued: u64,
+    completed: u64,
+    flushing: bool,
+    stats: Stats,
     /// Once durability is uncertain, stop exposing any valid token until the process is restarted.
     poisoned: bool,
 }
@@ -73,46 +103,70 @@ impl Inner {
         }
     }
 
-    fn persist(&mut self, r: &Record, fsync: bool) -> io::Result<()> {
+    fn check(&self, r: &Record) -> io::Result<()> {
         if self.poisoned {
-            return Err(io::Error::other(
-                "session journal is poisoned after a durability failure",
-            ));
+            return Err(poisoned());
         }
-        let bytes = postcard::to_stdvec(r).map_err(io::Error::other)?;
-        if bytes.len() > MAX_RECORD {
+        let (epoch, user, generation, freeze) = match r {
+            Record::Set {
+                epoch,
+                user,
+                generation,
+                ..
+            } => (*epoch, *user, *generation, false),
+            Record::Freeze {
+                epoch,
+                user,
+                generation,
+                ..
+            } => (*epoch, *user, *generation, true),
+        };
+        if self.pending.contains_key(&(epoch, user, generation))
+            || self.freezing.contains(&(epoch, user, generation))
+        {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session journal record too large",
+                if freeze {
+                    io::ErrorKind::AlreadyExists
+                } else {
+                    io::ErrorKind::Other
+                },
+                "session ownership migration is pending",
             ));
         }
-        let size = bytes.len() as u32;
-        let mut encoded = Vec::with_capacity(RECORD_HEADER + bytes.len());
-        encoded.extend_from_slice(&size.to_le_bytes());
-        // Protect framing separately so corrupting a complete record's length cannot masquerade as
-        // an incomplete append and silently drop a revocation or migration freeze.
-        encoded.extend_from_slice(&(!size).to_le_bytes());
-        encoded.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-        encoded.extend_from_slice(&bytes);
-        let result = self.file.write_all(&encoded).and_then(|()| {
-            if fsync {
-                self.file.sync_data()
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(e) = result {
-            self.poisoned = true;
-            return Err(e);
-        }
-        self.apply(r);
         Ok(())
     }
 }
 
+fn poisoned() -> io::Error {
+    io::Error::other("session journal is poisoned after a durability failure")
+}
+
+fn encode(r: &Record) -> io::Result<Vec<u8>> {
+    let bytes = postcard::to_stdvec(r).map_err(io::Error::other)?;
+    if bytes.len() > MAX_RECORD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session journal record too large",
+        ));
+    }
+    let size = bytes.len() as u32;
+    let mut encoded = Vec::with_capacity(RECORD_HEADER + bytes.len());
+    encoded.extend_from_slice(&size.to_le_bytes());
+    // Protect framing separately so corrupting a complete record's length cannot masquerade as
+    // an incomplete append and silently drop a revocation or migration freeze.
+    encoded.extend_from_slice(&(!size).to_le_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    encoded.extend_from_slice(&bytes);
+    Ok(encoded)
+}
+
 pub struct SessionStore {
     inner: Mutex<Inner>,
+    file: Mutex<File>,
+    committed: Condvar,
     fsync: bool,
+    #[cfg(test)]
+    pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl SessionStore {
@@ -120,6 +174,26 @@ impl SessionStore {
     /// return 503 while unhealthy; read methods independently fail closed as a final safeguard.
     pub fn healthy(&self) -> bool {
         !self.inner.lock().poisoned
+    }
+
+    /// Cumulative counters since opening the journal. Disk time excludes the batch collection delay;
+    /// commit wait includes queueing and durability, but never application-level per-user lock waits.
+    pub fn stats(&self) -> Stats {
+        self.inner.lock().stats
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_sync(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(self
+            .pause
+            .lock()
+            .replace((entered_tx, release_rx))
+            .is_none());
+        (entered_rx, release_tx)
     }
 
     pub fn open(dir: &Path, fsync: bool) -> io::Result<Self> {
@@ -149,10 +223,15 @@ impl SessionStore {
             }
         }
         let mut inner = Inner {
-            file,
             values: FxHashMap::default(),
             tokens: FxHashMap::default(),
             pending: FxHashMap::default(),
+            freezing: FxHashSet::default(),
+            queue: VecDeque::new(),
+            enqueued: 0,
+            completed: 0,
+            flushing: false,
+            stats: Stats::default(),
             poisoned: false,
         };
         let mut end = MAGIC.len() as u64;
@@ -163,7 +242,7 @@ impl SessionStore {
                 break;
             }
             let mut header = [0; RECORD_HEADER];
-            inner.file.read_exact(&mut header)?;
+            file.read_exact(&mut header)?;
             let size = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
             let complement = u32::from_le_bytes(header[4..8].try_into().unwrap());
             let crc = u32::from_le_bytes(header[8..].try_into().unwrap());
@@ -177,7 +256,7 @@ impl SessionStore {
                 break;
             }
             let mut bytes = vec![0; size];
-            inner.file.read_exact(&mut bytes)?;
+            file.read_exact(&mut bytes)?;
             if crc32fast::hash(&bytes) != crc {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -190,15 +269,19 @@ impl SessionStore {
             end += RECORD_HEADER as u64 + size as u64;
         }
         if len > end {
-            inner.file.set_len(end)?;
+            file.set_len(end)?;
             if fsync {
-                inner.file.sync_all()?;
+                file.sync_all()?;
             }
         }
-        inner.file.seek(SeekFrom::Start(end))?;
+        file.seek(SeekFrom::Start(end))?;
         Ok(Self {
             inner: Mutex::new(inner),
+            file: Mutex::new(file),
+            committed: Condvar::new(),
             fsync,
+            #[cfg(test)]
+            pause: Mutex::new(None),
         })
     }
 
@@ -223,17 +306,113 @@ impl SessionStore {
     }
 
     pub fn set(&self, epoch: u64, user: Id, generation: u64, token: Option<Id>) -> io::Result<()> {
-        let r = Record::Set {
+        self.persist(Record::Set {
             epoch,
             user,
             generation,
             token,
-        };
+        })
+    }
+
+    fn persist(&self, record: Record) -> io::Result<()> {
+        let started = Instant::now();
+        let encoded = encode(&record)?;
         let mut inner = self.inner.lock();
-        if inner.pending.contains_key(&(epoch, user, generation)) {
-            return Err(io::Error::other("session ownership migration is pending"));
+        inner.check(&record)?;
+        if let Record::Freeze {
+            epoch,
+            user,
+            generation,
+            ..
+        } = &record
+        {
+            inner.freezing.insert((*epoch, *user, *generation));
         }
-        inner.persist(&r, self.fsync)
+        inner.enqueued += 1;
+        let ticket = inner.enqueued;
+        inner.queue.push_back(Queued {
+            ticket,
+            record,
+            encoded,
+        });
+        loop {
+            // Even a previously committed operation must fail closed if a later I/O failed before
+            // it woke. Authentication cannot distinguish a partially appended later revocation.
+            if inner.poisoned {
+                return Err(poisoned());
+            }
+            if inner.completed >= ticket {
+                let elapsed = started.elapsed().as_micros() as u64;
+                inner.stats.commit_wait_us += elapsed;
+                inner.stats.commit_wait_max_us = inner.stats.commit_wait_max_us.max(elapsed);
+                return Ok(());
+            }
+            if inner.flushing {
+                self.committed.wait(&mut inner);
+                continue;
+            }
+            inner.flushing = true;
+            drop(inner);
+            // A bounded collection window lets independent users share one fsync. Updates arriving
+            // during disk I/O are collected by the next flusher, not serialized into one fsync each.
+            std::thread::sleep(BATCH_DELAY);
+            let batch: Vec<_> = {
+                let mut inner = self.inner.lock();
+                let count = inner.queue.len().min(MAX_BATCH);
+                inner.queue.drain(..count).collect()
+            };
+            let mut bytes = Vec::with_capacity(batch.iter().map(|q| q.encoded.len()).sum());
+            for q in &batch {
+                bytes.extend_from_slice(&q.encoded);
+            }
+            let disk_started = Instant::now();
+            let result =
+                {
+                    let mut file = self.file.lock();
+                    #[cfg(test)]
+                    if let Some((entered, release)) = self.pause.lock().take() {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                    file.write_all(&bytes).and_then(|()| {
+                        if self.fsync {
+                            file.sync_data()
+                        } else {
+                            Ok(())
+                        }
+                    })
+                };
+            let disk_us = disk_started.elapsed().as_micros() as u64;
+            inner = self.inner.lock();
+            inner.stats.disk_us += disk_us;
+            inner.stats.disk_max_us = inner.stats.disk_max_us.max(disk_us);
+            if result.is_err() {
+                inner.stats.failures += 1;
+                inner.poisoned = true;
+                inner.queue.clear();
+            } else {
+                inner.stats.records += batch.len() as u64;
+                inner.stats.batches += 1;
+                inner.stats.syncs += u64::from(self.fsync);
+                for q in &batch {
+                    inner.apply(&q.record);
+                    if let Record::Freeze {
+                        epoch,
+                        user,
+                        generation,
+                        ..
+                    } = &q.record
+                    {
+                        inner.freezing.remove(&(*epoch, *user, *generation));
+                    }
+                    inner.completed = q.ticket;
+                }
+            }
+            inner.flushing = false;
+            self.committed.notify_all();
+            // Return the concrete I/O error to the flusher; the other waiters observe poison.
+            result?;
+        }
     }
 
     /// Durable intent to hand off this generation. Retry this command after a lost response or a
@@ -249,22 +428,12 @@ impl SessionStore {
     /// The first frozen command wins. A duplicate returns AlreadyExists, and the caller can recover
     /// the original with `pending`. The existing active token is preserved while the handoff runs.
     pub fn freeze(&self, epoch: u64, user: Id, generation: u64, cmd: Command) -> io::Result<()> {
-        let mut inner = self.inner.lock();
-        if inner.pending.contains_key(&(epoch, user, generation)) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "session migration already frozen",
-            ));
-        }
-        inner.persist(
-            &Record::Freeze {
-                epoch,
-                user,
-                generation,
-                cmd,
-            },
-            self.fsync,
-        )
+        self.persist(Record::Freeze {
+            epoch,
+            user,
+            generation,
+            cmd,
+        })
     }
 }
 
@@ -284,6 +453,174 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for journal worker"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn authentication_reads_progress_while_sync_is_stalled() {
+        let dir = TempDir::new();
+        let s = std::sync::Arc::new(SessionStore::open(&dir.0, true).unwrap());
+        let user = Id::new_v4();
+        let old = Id::new_v4();
+        let new = Id::new_v4();
+        s.set(1, user, 0, Some(old)).unwrap();
+        let (entered, release) = s.pause_next_sync();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || done_tx.send(s.set(1, user, 0, Some(new))).unwrap())
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                read_tx
+                    .send((
+                        s.healthy(),
+                        s.get(1, user, 0),
+                        s.identify(1, old),
+                        s.identify(1, new),
+                        s.pending(1, user, 0).is_none(),
+                    ))
+                    .unwrap();
+            })
+        };
+        assert_eq!(
+            read_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("authentication waited for disk I/O"),
+            (true, Some(Some(old)), Some(user), None, true)
+        );
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(s.get(1, user, 0), Some(Some(new)));
+    }
+
+    #[test]
+    fn concurrent_updates_share_sync_and_survive_reopen() {
+        let dir = TempDir::new();
+        let s = std::sync::Arc::new(SessionStore::open(&dir.0, true).unwrap());
+        let records: Vec<_> = (0..17).map(|_| (Id::new_v4(), Id::new_v4())).collect();
+        let (entered, release) = s.pause_next_sync();
+        let mut writers = Vec::new();
+        for (index, &(user, token)) in records.iter().enumerate() {
+            let s = s.clone();
+            writers.push(std::thread::spawn(move || s.set(1, user, 0, Some(token))));
+            if index == 0 {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        // The first batch is paused before disk I/O. All remaining records are enqueued for the
+        // next batch, so this verifies batching deterministically rather than relying on timing.
+        wait_until(|| s.inner.lock().enqueued == records.len() as u64);
+        assert_eq!(s.stats().records, 0);
+        assert!(records.iter().all(|&(user, _)| s.get(1, user, 0).is_none()));
+        release.send(()).unwrap();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert_eq!(s.stats().records, records.len() as u64);
+        assert_eq!(s.stats().batches, 2);
+        assert_eq!(s.stats().syncs, 2);
+        drop(s);
+        let reopened = SessionStore::open(&dir.0, true).unwrap();
+        for (user, token) in records {
+            assert_eq!(reopened.get(1, user, 0), Some(Some(token)));
+            assert_eq!(reopened.identify(1, token), Some(user));
+        }
+    }
+
+    #[test]
+    fn failed_batch_rejects_all_queued_waiters_and_fails_closed() {
+        let dir = TempDir::new();
+        let s = std::sync::Arc::new(SessionStore::open(&dir.0, false).unwrap());
+        let user = Id::new_v4();
+        let token = Id::new_v4();
+        s.set(1, user, 0, Some(token)).unwrap();
+        *s.file.lock() = File::open(dir.0.join("sessions.log")).unwrap();
+        let (entered, release) = s.pause_next_sync();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut writers = Vec::new();
+        for index in 0..8 {
+            let s = s.clone();
+            let done = done_tx.clone();
+            writers.push(std::thread::spawn(move || {
+                let result = s.set(1, if index == 0 { user } else { Id::new_v4() }, 0, None);
+                done.send(result.is_err()).unwrap();
+            }));
+            if index == 0 {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        wait_until(|| s.inner.lock().enqueued == 9);
+        release.send(()).unwrap();
+        for _ in 0..8 {
+            assert!(done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("poisoned journal waiter stuck"));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(!s.healthy());
+        assert_eq!(s.get(1, user, 0), Some(None));
+        assert_eq!(s.identify(1, token), None);
+        assert_eq!(s.stats().records, 1);
+        assert_eq!(s.stats().failures, 1);
+    }
+
+    #[test]
+    fn queued_freeze_fences_later_mutations_before_publication() {
+        let dir = TempDir::new();
+        let s = std::sync::Arc::new(SessionStore::open(&dir.0, true).unwrap());
+        let user = Id::new_v4();
+        let token = Id::new_v4();
+        s.set(1, user, 0, Some(token)).unwrap();
+        let (entered, release) = s.pause_next_sync();
+        let first = {
+            let s = s.clone();
+            std::thread::spawn(move || s.set(1, Id::new_v4(), 0, None))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let freeze = {
+            let s = s.clone();
+            std::thread::spawn(move || s.freeze(1, user, 0, Command::Initialize))
+        };
+        wait_until(|| s.inner.lock().freezing.contains(&(1, user, 0)));
+        assert!(s.pending(1, user, 0).is_none());
+        assert_eq!(s.get(1, user, 0), Some(Some(token)));
+        assert!(s.set(1, user, 0, None).is_err());
+        assert_eq!(
+            s.freeze(1, user, 0, Command::Initialize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        release.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        freeze.join().unwrap().unwrap();
+        assert!(s.pending(1, user, 0).is_some());
+        assert!(s.set(1, user, 0, None).is_err());
     }
 
     #[test]
@@ -450,7 +787,7 @@ mod tests {
         assert!(s.healthy());
         s.set(1, user, 0, Some(token)).unwrap();
         // A read-only descriptor deterministically makes write_all fail on every supported platform.
-        s.inner.lock().file = File::open(dir.0.join("sessions.log")).unwrap();
+        *s.file.lock() = File::open(dir.0.join("sessions.log")).unwrap();
         assert!(s.set(1, user, 0, None).is_err());
         assert!(!s.healthy());
         assert_eq!(s.get(1, user, 0), Some(None));

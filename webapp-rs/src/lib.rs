@@ -7,6 +7,7 @@ pub mod apply;
 pub mod bans;
 pub mod blobs;
 pub mod command;
+pub mod compressionlog;
 pub mod config;
 pub mod entry;
 pub mod http;
@@ -23,6 +24,8 @@ pub mod server;
 pub mod session_net;
 pub mod session_store;
 pub mod sessions;
+#[cfg(test)]
+mod session_races;
 pub mod sha256mb;
 pub mod sign;
 pub mod sigshare;

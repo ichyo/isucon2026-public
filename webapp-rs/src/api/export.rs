@@ -39,7 +39,7 @@ pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
         }
     }
     // Off-lock (blocking pool): signatures, image bytes, zip.
-    let zip = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ApiError> {
+    let zip = tokio::task::spawn_blocking(move || -> Result<Bytes, ApiError> {
         let json = w.finish();
         let mut images = Vec::with_capacity(locs.len());
         for ((id, loc), f) in locs.iter().zip(fetched) {
@@ -48,7 +48,9 @@ pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
                 None => images.push(ctx.images.read_sync(*id, *loc).map_err(|e| ApiError::internal(format!("export: read image: {e}")))?),
             }
         }
-        Ok(build_zip(&images, &json, now_us()))
+        let zip = Bytes::from(build_zip(&images, &json, now_us()));
+        crate::compressionlog::export(&req, &zip, &images);
+        Ok(zip)
     })
     .await
     .map_err(ApiError::internal)??;

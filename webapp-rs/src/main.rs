@@ -13,6 +13,7 @@ fn main() {
         }
     };
     isureal::accesslog::init();
+    isureal::compressionlog::init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     rt.block_on(async move {
         if let Err(e) = isureal::server::start(cfg).await {

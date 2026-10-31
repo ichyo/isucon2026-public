@@ -91,12 +91,15 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     let mut action_id = metrics::A_NOT_FOUND;
     let mut repl = (0u64, 0u64);
     let req_bytes = content_length(&parts.headers);
-    let alog_token: Option<String> = crate::accesslog::enabled().then(|| {
+    let alog_headers: Option<(String, String)> = crate::accesslog::enabled().then(|| {
         let v = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("-");
         let ua = parts.headers.get(http::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
         let cc = parts.headers.get("x-country-code").and_then(|v| v.to_str().ok()).unwrap_or("-");
         let ua: String = ua.chars().take(60).map(|c| if c == '\t' { ' ' } else { c }).collect();
-        format!("{}\t{}\t{}", &v[v.len().saturating_sub(8)..], cc, ua)
+        (
+            format!("{}\t{}\t{}", &v[v.len().saturating_sub(8)..], cc, ua),
+            crate::accesslog::header_value(&parts.headers, http::header::ACCEPT_ENCODING),
+        )
     });
     let mut alog_body_us: i64 = -1;
 
@@ -212,10 +215,17 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         _ => 0,
     };
     app.metrics.record(action_id, resp.status, start.elapsed(), repl, req_bytes, resp_bytes);
-    if let Some(tok) = &alog_token {
+    if let Some((tok, accept_encoding)) = &alog_headers {
         let dur = start.elapsed().as_micros() as u64;
+        let ctype = resp.ctype.map(HeaderValue::from_static);
+        let content_type = crate::accesslog::header_values(
+            ctype.iter().chain(resp.headers.iter().filter_map(|(name, value)| (name == http::header::CONTENT_TYPE).then_some(value))),
+        );
+        let content_encoding = crate::accesslog::header_values(
+            resp.headers.iter().filter_map(|(name, value)| (name == http::header::CONTENT_ENCODING).then_some(value)),
+        );
         crate::accesslog::write(format_args!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             now_us() - dur as i64,
             dur,
             alog_body_us,
@@ -227,7 +237,10 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
             tok,
             req_bytes,
             resp_bytes,
-            path
+            path,
+            accept_encoding,
+            content_type,
+            content_encoding
         ));
     }
     if let Some(d) = app.throttle.delay(kind) {
