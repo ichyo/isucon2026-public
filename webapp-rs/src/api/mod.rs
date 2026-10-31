@@ -19,7 +19,7 @@ pub mod windows;
 /// Everything a handler file usually needs: `use crate::api::prelude::*;`
 pub mod prelude {
     pub use crate::app::{AuthAdmin, AuthUser, Ctx};
-    pub use crate::command::{Command, ExecResult, Outcome, Tx};
+    pub use crate::command::{Blob, Command, ExecResult, Outcome, Tx};
     pub use crate::entry::LogEntry;
     pub use crate::http::{Abuse, ApiError, Body, HResult, Req, Resp};
     pub use crate::json::JsonOut;

@@ -4,6 +4,7 @@ pub mod api;
 pub mod app;
 pub mod apply;
 pub mod bans;
+pub mod blobs;
 pub mod command;
 pub mod config;
 pub mod entry;

@@ -9,7 +9,7 @@ use super::prelude::*;
 pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
     let me = ctx.auth_pinned(&req)?;
     // Under the read lock: posts.json (signatures still pending) + the image locations, in export order.
-    let mut locs: Vec<ImageLoc> = Vec::new();
+    let mut locs: Vec<(Id, ImageLoc)> = Vec::new();
     let w = ctx.render(|st, w| {
         w.arr();
         for &p in &st.user(me.idx).posts {
@@ -18,7 +18,7 @@ pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
                 continue;
             }
             let meta = st.images.get(&post.image).ok_or_else(|| ApiError::internal(format!("export: image {} of post {} missing", post.image, post.id)))?;
-            locs.push(meta.loc);
+            locs.push((post.image, meta.loc));
             let path = image_path(locs.len());
             views::post(w, st, p, |w| {
                 w.k("imagePath").s(&path);
@@ -27,12 +27,26 @@ pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
         w.end();
         Ok(())
     })?;
+    // Large uploads of other nodes (rare: the user changed region) are fetched from their origin first.
+    let mut fetched: Vec<Option<Bytes>> = vec![None; locs.len()];
+    for (i, (id, loc)) in locs.iter().enumerate() {
+        if matches!(loc, ImageLoc::Remote { .. }) {
+            let b = ctx.images.read(*id, *loc).await.map_err(|e| {
+                eprintln!("[export] fetch of {id} failed: {e}");
+                ApiError::unavailable("image temporarily unavailable")
+            })?;
+            fetched[i] = Some(b);
+        }
+    }
     // Off-lock (blocking pool): signatures, image bytes, zip.
     let zip = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ApiError> {
         let json = w.finish();
         let mut images = Vec::with_capacity(locs.len());
-        for loc in &locs {
-            images.push(ctx.images.read_sync(*loc).map_err(|e| ApiError::internal(format!("export: read image: {e}")))?);
+        for ((id, loc), f) in locs.iter().zip(fetched) {
+            match f {
+                Some(b) => images.push(b),
+                None => images.push(ctx.images.read_sync(*id, *loc).map_err(|e| ApiError::internal(format!("export: read image: {e}")))?),
+            }
         }
         Ok(build_zip(&images, &json, now_us()))
     })

@@ -13,6 +13,33 @@ use crate::http::ApiError;
 use crate::model::*;
 use crate::state::State;
 
+/// An uploaded image carried by a command: small ones inline (replicated in the log), large ones already
+/// stored durably on the origin node (only the reference is replicated). Handlers pass `bytes.into()`;
+/// `App::write` converts large inline blobs into `Stored` before the command leaves the origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Blob {
+    Inline(Bytes),
+    Stored(BlobRef),
+}
+
+impl From<Bytes> for Blob {
+    fn from(b: Bytes) -> Blob {
+        Blob::Inline(b)
+    }
+}
+
+impl Blob {
+    pub fn len(&self) -> usize {
+        match self {
+            Blob::Inline(b) => b.len(),
+            Blob::Stored(r) => r.len as usize,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     /// POST /api/initialize (handled by the replication layer, not by exec)
@@ -28,7 +55,7 @@ pub enum Command {
     Logout { token: Id },
     UpdateProfile { user: Id, display_name: Option<String>, bio: Option<String>, region: Option<Region> },
     /// validated JPEG (≤512×512)
-    SetProfileImage { user: Id, image: Bytes },
+    SetProfileImage { user: Id, image: Blob },
     DeleteProfileImage { user: Id },
     DeleteAccount { user: Id },
     CreateFriendRequest { actor: Id, recipient: String },
@@ -45,7 +72,7 @@ pub enum Command {
     // ---- group B ----
     OpenWindow { region: Region, local_date: Date, on_time_seconds: i64 },
     /// validated JPEG (≤4096×4096) + validated fields
-    CreatePost { actor: Id, image: Bytes, caption: String, visibility: Visibility, location: Location },
+    CreatePost { actor: Id, image: Blob, caption: String, visibility: Visibility, location: Location },
     UpdatePost { actor: Id, post: String, caption: Option<String>, visibility: Option<Visibility> },
     DeletePost { actor: Id, post: String },
 
@@ -53,13 +80,19 @@ pub enum Command {
     CreateComment { actor: Id, post: String, body: String },
     DeleteComment { actor: Id, comment: String },
     /// validated JPEG (≤512×512)
-    PutRealMoji { actor: Id, post: String, reaction: Reaction, image: Bytes },
+    PutRealMoji { actor: Id, post: String, reaction: Reaction, image: Blob },
     DeleteRealMoji { actor: Id, realmoji: String },
 }
 
 impl Command {
     /// The image blob carried by this command (at most one).
-    pub fn blob(&self) -> Option<&Bytes> {
+    pub fn blob(&self) -> Option<&Blob> {
+        match self {
+            Command::SetProfileImage { image, .. } | Command::CreatePost { image, .. } | Command::PutRealMoji { image, .. } => Some(image),
+            _ => None,
+        }
+    }
+    pub fn blob_mut(&mut self) -> Option<&mut Blob> {
         match self {
             Command::SetProfileImage { image, .. } | Command::CreatePost { image, .. } | Command::PutRealMoji { image, .. } => Some(image),
             _ => None,
@@ -125,7 +158,7 @@ impl Outcome {
 pub struct Tx {
     /// leader wall clock at execution (µs) — use for every timestamp of this command
     pub now: Ts,
-    pub(crate) entries: Vec<(LogEntry, Option<Bytes>)>,
+    pub(crate) entries: Vec<(LogEntry, Option<Blob>)>,
     pub dry_run: bool,
 }
 
@@ -144,7 +177,7 @@ impl Tx {
         self.entries.push((e, None));
     }
     /// Entry whose record carries the command's image blob (PostCreated / RealMojiCreated / ProfileImageSet).
-    pub fn push_blob(&mut self, e: LogEntry, blob: Bytes) {
+    pub fn push_blob(&mut self, e: LogEntry, blob: Blob) {
         self.entries.push((e, Some(blob)));
     }
     pub fn is_empty(&self) -> bool {

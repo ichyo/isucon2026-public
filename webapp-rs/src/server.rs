@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use crate::app::App;
 use crate::apply::apply;
 use crate::bans::Bans;
+use crate::blobs::{BlobCache, BlobNet, BlobStore};
 use crate::config::Config;
 use crate::entry::BlobIn;
 use crate::http::router::Router;
@@ -28,6 +29,18 @@ pub struct Node {
     pub http_addr: SocketAddr,
     pub repl_addr: Option<SocketAddr>,
     pub control_addr: Option<SocketAddr>,
+    pub blob_addr: Option<SocketAddr>,
+}
+
+/// Points every node's blob client at the others' actual blob-service addresses (tests / ephemeral ports).
+pub fn wire_blob_peers(nodes: &[&Node]) {
+    for n in nodes {
+        for m in nodes {
+            if let Some(a) = m.blob_addr {
+                n.app.images.net.set_peer(m.app.cfg.region, a.to_string());
+            }
+        }
+    }
 }
 
 pub async fn start(cfg: Config) -> anyhow::Result<Node> {
@@ -46,6 +59,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         cfg.fsync,
         cfg.exp_quantum
     );
+    eprintln!(
+        "[start] blobs: listen={} peers={:?} inline_max={} bytes (larger uploads stay on their origin node)",
+        cfg.blob_listen, cfg.blob_peers, cfg.blob_inline_max
+    );
     eprintln!("[start] throttle: ms={} feed_ms={} (change: curl -XPOST '{}/throttle?ms=N&feed_ms=M')", cfg.throttle_ms, cfg.throttle_feed_ms, cfg.control_listen);
 
     let dir = cfg.initial_dir.clone();
@@ -54,7 +71,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let live = repl::clone_pristine_arc(&pristine).await;
 
     let wal = Wal::open(&cfg.data_dir, cfg.fsync).context("opening WAL")?;
-    let images = ImageStore::open(&cfg.initial_dir, wal.file()).context("opening images.pack")?;
+    let blobs = BlobStore::open(&cfg.data_dir, cfg.fsync).context("opening blob store")?;
+    let cache = BlobCache::open(&cfg.data_dir).context("opening blob cache")?;
+    let net = BlobNet::new(cfg.blob_peers.clone());
+    let images = ImageStore::open(&cfg.initial_dir, wal.file(), blobs, cache, net).context("opening images.pack")?;
     let statics = StaticFiles::load(&cfg.public_dir);
     let repl = if cfg.is_leader() { Repl::Leader(repl::Leader::new()) } else { Repl::Follower(repl::Follower::new()) };
     let app: &'static App = Box::leak(Box::new(App {
@@ -74,6 +94,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
 
     // replay the local WAL
     {
+        let region = app.cfg.region;
         let t = Instant::now();
         let mut st = app.state.write();
         let mut fx = Vec::new();
@@ -82,6 +103,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
             .replay(|d, _rec, off| {
                 let loc = match d.blob {
                     BlobIn::Inline { off: o, len } => Some(ImageLoc::Wal { off: off + o as u64, len: len as u32 }),
+                    BlobIn::Ref(r) => Some(r.loc_on(region)),
                     _ => None,
                 };
                 apply(&mut st, &d.entry, loc, &mut fx);
@@ -103,6 +125,16 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         Repl::Follower(_) => {
             tokio::spawn(repl::follower::run(app));
         }
+    }
+
+    // internal blob service (every node serves its own blobs.dat)
+    let mut blob_addr = None;
+    match TcpListener::bind(&app.cfg.blob_listen).await {
+        Ok(l) => {
+            blob_addr = Some(l.local_addr()?);
+            tokio::spawn(crate::blobs::serve(&app.images.blobs, &app.images.net, l));
+        }
+        Err(e) => eprintln!("[start] WARN cannot bind blob service {}: {e} (other nodes cannot fetch this node's uploads!)", app.cfg.blob_listen),
     }
 
     // control server
@@ -129,6 +161,6 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let l = TcpListener::bind(&app.cfg.listen).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
     let http_addr = l.local_addr()?;
     tokio::spawn(crate::http::serve(app, l));
-    eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} control={control_addr:?} in {:.1?}", t0.elapsed());
-    Ok(Node { app, http_addr, repl_addr, control_addr })
+    eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} blob={blob_addr:?} control={control_addr:?} in {:.1?}", t0.elapsed());
+    Ok(Node { app, http_addr, repl_addr, control_addr, blob_addr })
 }

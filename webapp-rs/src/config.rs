@@ -21,6 +21,12 @@ pub struct Config {
     pub repl_listen: String,
     pub leader_addr: String,
     pub control_listen: String,
+    /// internal blob service (every node)
+    pub blob_listen: String,
+    /// blob service address of every node (index = Region::idx())
+    pub blob_peers: [Option<String>; 3],
+    /// uploads larger than this are stored on the origin node only (not replicated in the log)
+    pub blob_inline_max: usize,
     pub data_dir: PathBuf,
     pub initial_dir: PathBuf,
     pub public_dir: PathBuf,
@@ -34,6 +40,9 @@ pub struct Config {
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
+
+pub const DEFAULT_BLOB_PEERS: &str = "asia=192.168.1.10:7001,europe=192.168.2.10:7001,america=192.168.3.10:7001";
+pub const DEFAULT_BLOB_INLINE_MAX: usize = 64 * 1024;
 
 pub fn default_leader_addr(r: Region) -> &'static str {
     match r {
@@ -70,6 +79,9 @@ impl Config {
             repl_listen: env("ISUREAL_REPL_LISTEN").unwrap_or_else(|| "0.0.0.0:7000".into()),
             leader_addr: env("ISUREAL_LEADER_ADDR").unwrap_or_else(|| default_leader_addr(leader_region).into()),
             control_listen: env("ISUREAL_CONTROL_LISTEN").unwrap_or_else(|| "127.0.0.1:9100".into()),
+            blob_listen: env("ISUREAL_BLOB_LISTEN").unwrap_or_else(|| "0.0.0.0:7001".into()),
+            blob_peers: crate::blobs::parse_peers(&env("ISUREAL_BLOB_PEERS").unwrap_or_else(|| DEFAULT_BLOB_PEERS.into()))?,
+            blob_inline_max: num("ISUREAL_BLOB_INLINE_MAX", DEFAULT_BLOB_INLINE_MAX as u64)? as usize,
             data_dir: env("ISUREAL_DATA_DIR").unwrap_or_else(|| "/home/isucon/data".into()).into(),
             initial_dir: env("ISUREAL_INITIAL_DIR").unwrap_or_else(|| "/home/isucon/initial".into()).into(),
             public_dir: env("ISUREAL_PUBLIC_DIR").unwrap_or_else(|| "/home/isucon/webapp/public".into()).into(),

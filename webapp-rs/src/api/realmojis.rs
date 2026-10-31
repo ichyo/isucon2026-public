@@ -30,7 +30,7 @@ pub async fn replace_real_moji(ctx: Ctx, mut req: Req) -> HResult {
     if dims.width > MAX_DIM || dims.height > MAX_DIM {
         return Err(invalid());
     }
-    let out = ctx.write(Command::PutRealMoji { actor: me.id, post, reaction, image }).await?;
+    let out = ctx.write(Command::PutRealMoji { actor: me.id, post, reaction, image: image.into() }).await?;
     ctx.respond(201, |st, w| {
         let r = st.realmoji_idx(out.id()).ok_or_else(ApiError::internal_unknown)?;
         views::realmoji(w, st, r);
@@ -41,7 +41,7 @@ pub async fn replace_real_moji(ctx: Ctx, mut req: Req) -> HResult {
 
 /// Emits `tx.push_blob(LogEntry::RealMojiCreated { .. }, image.clone())` (apply marks the previous one replaced).
 /// Outcome::Id(realmoji id).
-pub fn exec_put_realmoji(st: &State, tx: &mut Tx, actor: Id, post: &str, reaction: Reaction, image: &Bytes) -> ExecResult {
+pub fn exec_put_realmoji(st: &State, tx: &mut Tx, actor: Id, post: &str, reaction: Reaction, image: &Blob) -> ExecResult {
     let a = active_actor(st, actor)?;
     // 2. post missing/deleted ⇒ 403; actor is the author ⇒ 403
     let p = st.post_idx_str(post).filter(|&p| st.post(p).deleted_at.is_none()).ok_or_else(forbidden)?;

@@ -65,6 +65,9 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         ApiError::new(413, "Request Entity Too Large").into_resp()
     } else if app.bans.is_banned(&ip, now_us()) {
         ApiError::forbidden("ip_banned").into_resp()
+    } else if path.starts_with("/api/") && !follower_in_sync(app).await {
+        // never answer from a replica that is known to be behind (link down / catching up / resetting)
+        ApiError::unavailable("replica not in sync").into_resp()
     } else if !path.starts_with("/api/") {
         if parts.method == Method::GET || parts.method == Method::HEAD {
             match app.statics.get(&path) {
@@ -115,6 +118,14 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         eprintln!("[req] {} {} {} action={} ip={} {:.1?}", parts.method, path, resp.status, action, ip, start.elapsed());
     }
     Ok(to_hyper(resp))
+}
+
+/// Followers hold API requests until they are in sync with the leader (bounded wait); the leader never waits.
+async fn follower_in_sync(app: &'static App) -> bool {
+    match &app.repl {
+        crate::repl::Repl::Follower(f) => f.in_sync() || f.wait_in_sync(crate::repl::follower::SYNC_WAIT).await,
+        crate::repl::Repl::Leader(_) => true,
+    }
 }
 
 pub fn to_hyper(resp: Resp) -> Response<HBody> {

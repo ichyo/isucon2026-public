@@ -68,13 +68,13 @@ pub async fn put_profile_image(ctx: Ctx, mut req: Req) -> HResult {
     if dims.width > PROFILE_IMAGE_MAX || dims.height > PROFILE_IMAGE_MAX {
         return Err(invalid());
     }
-    ctx.write(Command::SetProfileImage { user: me.id, image }).await?;
+    ctx.write(Command::SetProfileImage { user: me.id, image: image.into() }).await?;
     Ok(Resp::no_content())
 }
 
 /// Emits `tx.push_blob(LogEntry::ProfileImageSet { image: Some(new_id), .. }, image.clone())`; apply
 /// hard-deletes the previous profile image.
-pub fn exec_set_profile_image(st: &State, tx: &mut Tx, user: Id, image: &Bytes) -> ExecResult {
+pub fn exec_set_profile_image(st: &State, tx: &mut Tx, user: Id, image: &Blob) -> ExecResult {
     active_actor(st, user)?;
     let id = tx.new_id();
     tx.push_blob(LogEntry::ProfileImageSet { user, image: Some(id), at: tx.now }, image.clone());

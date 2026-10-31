@@ -98,6 +98,22 @@ pub fn make_jpeg(w: u16, h: u16, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Noisy (poorly compressible) JPEG, roughly the size of a benchmark post image (~0.5 MB at 1448×1086).
+pub fn make_noisy_jpeg(w: u16, h: u16, seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut px = Vec::with_capacity(w as usize * h as usize * 3);
+    for _ in 0..(w as usize * h as usize) {
+        let v = rng.next();
+        px.push(v as u8);
+        px.push((v >> 8) as u8 / 2 + 64);
+        px.push((v >> 16) as u8 / 3 + 32);
+    }
+    let mut out = Vec::new();
+    let enc = jpeg_encoder::Encoder::new(&mut out, 40);
+    enc.encode(&px, w, h, jpeg_encoder::ColorType::Rgb).expect("jpeg encode");
+    out
+}
+
 /// CSV field: NULL (None) = empty unquoted; strings are quoted when needed; empty string = `""`.
 fn csv_str(s: &str) -> String {
     if s.is_empty() {
@@ -486,6 +502,7 @@ pub fn generate(dir: &Path, scale: Scale) -> io::Result<Summary> {
         let jd = dir.parent().unwrap_or(dir).join("jpeg");
         fs::create_dir_all(&jd)?;
         fs::write(jd.join("post_640x480.jpg"), make_jpeg(640, 480, 1))?;
+        fs::write(jd.join("post_1448x1086.jpg"), make_noisy_jpeg(1448, 1086, 9))?;
         fs::write(jd.join("realmoji_128.jpg"), make_jpeg(128, 128, 2))?;
         fs::write(jd.join("profile_96.jpg"), make_jpeg(96, 96, 3))?;
         fs::write(jd.join("big_600x600.jpg"), make_jpeg(600, 600, 4))?;

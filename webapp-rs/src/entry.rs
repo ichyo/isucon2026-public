@@ -2,7 +2,8 @@
 //!
 //! Record = `[u32 len][u32 crc32(body)][body]`,
 //! body   = `[u64 seq][u32 meta_len][postcard(LogEntry)][u8 blob_kind]` +
-//!          kind 0: nothing | kind 1: `[u32 blob_len][blob]` | kind 2: `[u64 req_id]` (FromForward, wire only).
+//!          kind 0: nothing | kind 1: `[u32 blob_len][blob]` | kind 2: `[u64 req_id]` (FromForward, wire only)
+//!          | kind 3: `[u8 origin][u64 key][u64 off][u32 len]` (large blob stored on its origin node).
 
 use std::sync::Arc;
 
@@ -50,6 +51,7 @@ pub enum BlobOut<'a> {
     None,
     Inline(&'a [u8]),
     FromForward(u64),
+    Ref(BlobRef),
 }
 
 pub const REC_HDR: usize = 8; // len + crc
@@ -61,6 +63,7 @@ pub fn encode_record(seq: u64, entry: &LogEntry, blob: BlobOut<'_>) -> (Vec<u8>,
         BlobOut::None => 0,
         BlobOut::Inline(b) => 4 + b.len(),
         BlobOut::FromForward(_) => 8,
+        BlobOut::Ref(_) => 21,
     };
     let body_len = 8 + 4 + meta.len() + 1 + blob_extra;
     let mut out = Vec::with_capacity(REC_HDR + body_len);
@@ -82,6 +85,13 @@ pub fn encode_record(seq: u64, entry: &LogEntry, blob: BlobOut<'_>) -> (Vec<u8>,
             out.push(2);
             out.extend_from_slice(&req.to_le_bytes());
         }
+        BlobOut::Ref(r) => {
+            out.push(3);
+            out.push(r.origin as u8);
+            out.extend_from_slice(&r.key.to_le_bytes());
+            out.extend_from_slice(&r.off.to_le_bytes());
+            out.extend_from_slice(&r.len.to_le_bytes());
+        }
     }
     let crc = crc32fast::hash(&out[REC_HDR..]);
     out[4..8].copy_from_slice(&crc.to_le_bytes());
@@ -94,6 +104,7 @@ pub enum BlobIn {
     /// (offset within the record, len)
     Inline { off: usize, len: usize },
     FromForward(u64),
+    Ref(BlobRef),
 }
 
 #[derive(Debug)]
@@ -159,6 +170,23 @@ pub fn decode_record(buf: &[u8]) -> Result<Decoded, DecodeErr> {
             }
             BlobIn::FromForward(u64::from_le_bytes(body[kpos + 1..kpos + 9].try_into().unwrap()))
         }
+        3 => {
+            if body.len() != kpos + 22 {
+                return Err(DecodeErr::Corrupt("ref"));
+            }
+            let origin = match body[kpos + 1] {
+                0 => Region::Asia,
+                1 => Region::Europe,
+                2 => Region::America,
+                _ => return Err(DecodeErr::Corrupt("ref origin")),
+            };
+            BlobIn::Ref(BlobRef {
+                origin,
+                key: u64::from_le_bytes(body[kpos + 2..kpos + 10].try_into().unwrap()),
+                off: u64::from_le_bytes(body[kpos + 10..kpos + 18].try_into().unwrap()),
+                len: u32::from_le_bytes(body[kpos + 18..kpos + 22].try_into().unwrap()),
+            })
+        }
         _ => return Err(DecodeErr::Corrupt("blob kind")),
     };
     Ok(Decoded { seq, crc, entry, blob, len: total })
@@ -180,6 +208,10 @@ mod tests {
         assert_eq!(&r[o..o + len], b"JPEGDATA");
         let (r2, _) = encode_record(8, &e, BlobOut::FromForward(99));
         assert_eq!(decode_record(&r2).unwrap().blob, BlobIn::FromForward(99));
+        let br = BlobRef { origin: Region::America, key: 0xdead_beef, off: 1 << 33, len: 500_000 };
+        let (r3, off3) = encode_record(9, &e, BlobOut::Ref(br));
+        assert_eq!(off3, None);
+        assert_eq!(decode_record(&r3).unwrap().blob, BlobIn::Ref(br));
         let mut bad = r.clone();
         let n = bad.len();
         bad[n - 1] ^= 1;

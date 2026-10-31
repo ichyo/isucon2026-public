@@ -1,11 +1,16 @@
 //! Leader: executes commands, appends + applies + streams records, tracks cumulative acks, serves catch-up.
+//!
+//! Invariant: a client write is acknowledged only after every *connected* follower (catching up or not) has
+//! applied + persisted its records. Slow links are waited for (warning after 1 s); a link is dropped only on a
+//! connection error or after `ACK_TIMEOUT`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -13,14 +18,24 @@ use super::proto::{self, Ack, Forward, Hello, Reset, ResponseMsg};
 use super::Origin;
 use crate::app::{App, WaitPolicy};
 use crate::apply::apply;
-use crate::command::{self, Command, Outcome, Tx};
+use crate::command::{self, Blob, Command, Outcome, Tx};
 use crate::entry::{encode_record, BlobOut};
 use crate::http::ApiError;
 use crate::model::*;
 
-pub const ACK_TIMEOUT: Duration = Duration::from_secs(3);
-pub const RESET_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connected follower that has not acked after this long is dropped (it reconnects and catches up).
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(25);
+/// Acks slower than this are logged (rate-limited) and counted.
+pub const SLOW_ACK: Duration = Duration::from_secs(1);
+pub const RESET_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle links get a heartbeat this often (keeps the follower's read lease alive).
+pub const HEARTBEAT_EVERY: Duration = Duration::from_millis(250);
 const CATCHUP_CHUNK: u64 = 4 << 20;
+
+fn mono_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
 
 pub struct Link {
     pub id: u64,
@@ -28,16 +43,26 @@ pub struct Link {
     tx: mpsc::UnboundedSender<Bytes>,
     /// cumulative (epoch, seq) acked by the follower
     acked: watch::Sender<(u64, u64)>,
+    /// informational: acked ≥ catch-up target
     in_sync: AtomicBool,
-    /// (epoch, seq) the follower must reach to count as in-sync
+    /// (epoch, seq) the follower must reach to count as caught up
     target: Mutex<(u64, u64)>,
     kill: Notify,
     dead: AtomicBool,
+    /// bytes queued for this link but not yet written to the socket
+    queue_bytes: AtomicU64,
+    max_ack_us: AtomicU64,
+    slow_acks: AtomicU64,
+    last_warn_us: AtomicU64,
+    connected_at: Instant,
 }
 
 impl Link {
     fn send(&self, f: Bytes) {
-        let _ = self.tx.send(f);
+        self.queue_bytes.fetch_add(f.len() as u64, Ordering::Relaxed);
+        if self.tx.send(f).is_err() {
+            self.queue_bytes.store(0, Ordering::Relaxed);
+        }
     }
     fn kill(&self) {
         if !self.dead.swap(true, Ordering::SeqCst) {
@@ -46,15 +71,19 @@ impl Link {
             self.kill.notify_one();
         }
     }
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
     fn on_ack(&self, a: Ack) {
         self.acked.send_replace((a.epoch, a.seq));
         let t = *self.target.lock();
         if a.epoch == t.0 && a.seq >= t.1 && !self.in_sync.swap(true, Ordering::SeqCst) {
-            eprintln!("[repl] link {} ({}) in sync at seq {}", self.id, self.region.as_str(), a.seq);
+            eprintln!("[repl] link {} ({}) caught up at seq {}", self.id, self.region.as_str(), a.seq);
         }
     }
+    /// true when `pred` holds within `timeout`; false on timeout or kill.
     async fn wait_ack(&self, pred: impl Fn(&(u64, u64)) -> bool, timeout: Duration) -> bool {
-        if self.dead.load(Ordering::SeqCst) {
+        if self.is_dead() {
             return false;
         }
         let mut rx = self.acked.subscribe();
@@ -62,6 +91,44 @@ impl Link {
             r = tokio::time::timeout(timeout, rx.wait_for(|v| pred(v))) => matches!(r, Ok(Ok(_))),
             _ = self.kill.notified() => false,
         }
+    }
+    /// Waits for (epoch, seq) with slow-ack warnings; drops the link after ACK_TIMEOUT.
+    async fn wait_applied(&self, epoch: u64, seq: u64) {
+        let t0 = Instant::now();
+        let mut counted = false;
+        loop {
+            if self.wait_ack(|&(e, s)| e != epoch || s >= seq, SLOW_ACK).await {
+                break;
+            }
+            if self.is_dead() {
+                break;
+            }
+            let el = t0.elapsed();
+            if el >= ACK_TIMEOUT {
+                eprintln!("[repl] link {} ({}) did not ack seq {seq} within {:?}; dropping it", self.id, self.region.as_str(), ACK_TIMEOUT);
+                self.kill();
+                break;
+            }
+            if !counted {
+                counted = true;
+                self.slow_acks.fetch_add(1, Ordering::Relaxed);
+            }
+            let now = mono_us();
+            let last = self.last_warn_us.load(Ordering::Relaxed);
+            if (last == 0 || now.saturating_sub(last) > 1_000_000) && self.last_warn_us.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                let (ae, asq) = *self.acked.borrow();
+                eprintln!(
+                    "[repl] WARN slow ack: link {} ({}) seq {seq} not applied after {:.1?} (acked {}:{}, queued {} bytes)",
+                    self.id,
+                    self.region.as_str(),
+                    el,
+                    ae,
+                    asq,
+                    self.queue_bytes.load(Ordering::Relaxed)
+                );
+            }
+        }
+        self.max_ack_us.fetch_max(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -102,17 +169,27 @@ impl Leader {
             let mut lsn = 0;
             for (entry, blob) in tx.entries.drain(..) {
                 let seq = wal.last_seq + 1;
-                let (rec, blob_off) = encode_record(seq, &entry, blob.as_deref().map_or(BlobOut::None, BlobOut::Inline));
+                let out = match &blob {
+                    None => BlobOut::None,
+                    Some(Blob::Inline(b)) => BlobOut::Inline(b),
+                    Some(Blob::Stored(r)) => BlobOut::Ref(*r),
+                };
+                let (rec, blob_off) = encode_record(seq, &entry, out);
                 let (off, l) = app.wal.append(&mut wal, &rec, seq).unwrap_or_else(|e| {
                     eprintln!("[wal] FATAL append failed: {e}");
                     std::process::abort();
                 });
                 lsn = l;
-                let loc = blob_off.map(|o| ImageLoc::Wal { off: off + o as u64, len: blob.as_ref().map_or(0, |b| b.len()) as u32 });
+                let loc = match &blob {
+                    None => None,
+                    Some(Blob::Inline(b)) => blob_off.map(|o| ImageLoc::Wal { off: off + o as u64, len: b.len() as u32 }),
+                    Some(Blob::Stored(r)) => Some(r.loc_on(app.cfg.region)),
+                };
                 apply(&mut st, &entry, loc, &mut fx);
                 for (i, link) in links.iter().enumerate() {
-                    match origin {
-                        Origin::Link { link: lid, req_id } if lid == link.id && blob.is_some() => {
+                    match (origin, &blob) {
+                        // the origin follower already has the (small) bytes: do not send them back
+                        (Origin::Link { link: lid, req_id }, Some(Blob::Inline(_))) if lid == link.id => {
                             let (r2, _) = encode_record(seq, &entry, BlobOut::FromForward(req_id));
                             payloads[i].extend_from_slice(&r2);
                         }
@@ -127,14 +204,11 @@ impl Leader {
             (outcome, wal.epoch, wal.last_seq, lsn, links)
         };
         if policy == WaitPolicy::AllReplicas {
+            // every connected follower (also one still catching up: it applies these right after its
+            // catch-up stream) must have applied the records before the client sees success
             for link in links.iter() {
-                if !link.in_sync.load(Ordering::SeqCst) {
-                    continue;
-                }
-                let ok = link.wait_ack(|&(e, s)| e != epoch || s >= seq, ACK_TIMEOUT).await;
-                if !ok && !link.dead.load(Ordering::SeqCst) {
-                    eprintln!("[repl] link {} ({}) did not ack seq {seq} in time; dropping it", link.id, link.region.as_str());
-                    link.kill();
+                if !link.is_dead() {
+                    link.wait_applied(epoch, seq).await;
                 }
             }
         }
@@ -145,7 +219,7 @@ impl Leader {
     /// POST /api/initialize: new epoch everywhere.
     pub async fn initialize(&self, app: &'static App) -> Result<(), ApiError> {
         let _g = self.init_lock.lock().await;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let fresh = super::clone_pristine(app).await;
         let mut epoch = rand_u64();
         let (old, links) = {
@@ -156,6 +230,7 @@ impl Leader {
             }
             app.wal.reset(&mut wal, epoch).map_err(|e| ApiError::internal(format!("wal reset: {e}")))?;
             let old = app.swap_state(&mut st, fresh);
+            app.images.reset_uploads_for_epoch(epoch);
             let links: Vec<Arc<Link>> = self.links.lock().clone();
             for l in &links {
                 l.in_sync.store(false, Ordering::SeqCst);
@@ -166,7 +241,7 @@ impl Leader {
         };
         super::drop_in_background(old);
         for l in &links {
-            if !l.wait_ack(|&(e, _)| e == epoch, RESET_TIMEOUT).await {
+            if !l.wait_ack(|&(e, _)| e == epoch, RESET_TIMEOUT).await && !l.is_dead() {
                 eprintln!("[repl] link {} ({}) did not ack reset; dropping it", l.id, l.region.as_str());
                 l.kill();
             }
@@ -182,12 +257,16 @@ impl Leader {
             .map(|l| {
                 let (e, s) = *l.acked.borrow();
                 format!(
-                    "{{\"id\":{},\"region\":\"{}\",\"in_sync\":{},\"acked_epoch\":{},\"acked_seq\":{}}}",
+                    "{{\"id\":{},\"region\":\"{}\",\"caught_up\":{},\"acked_epoch\":{},\"acked_seq\":{},\"queue_bytes\":{},\"max_ack_ms\":{:.1},\"slow_acks\":{},\"connected_s\":{}}}",
                     l.id,
                     l.region.as_str(),
                     l.in_sync.load(Ordering::SeqCst),
                     e,
-                    s
+                    s,
+                    l.queue_bytes.load(Ordering::Relaxed),
+                    l.max_ack_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                    l.slow_acks.load(Ordering::Relaxed),
+                    l.connected_at.elapsed().as_secs()
                 )
             })
             .collect();
@@ -230,6 +309,34 @@ fn leader(app: &App) -> &Leader {
     }
 }
 
+/// Live writer: coalesces queued frames into one flush, heartbeats when idle, tracks queued bytes.
+async fn live_writer(wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Bytes>, link: Arc<Link>) -> std::io::Result<()> {
+    let mut bw = tokio::io::BufWriter::with_capacity(256 * 1024, wr);
+    let hb = proto::frame(proto::HEARTBEAT, &[]);
+    loop {
+        let f = tokio::select! {
+            f = rx.recv() => match f {
+                Some(f) => f,
+                None => return Ok(()),
+            },
+            _ = tokio::time::sleep(HEARTBEAT_EVERY) => {
+                bw.write_all(&hb).await?;
+                bw.flush().await?;
+                continue;
+            }
+            _ = link.kill.notified() => return Ok(()),
+        };
+        let mut n = f.len() as u64;
+        bw.write_all(&f).await?;
+        while let Ok(f) = rx.try_recv() {
+            n += f.len() as u64;
+            bw.write_all(&f).await?;
+        }
+        bw.flush().await?;
+        let _ = link.queue_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |q| Some(q.saturating_sub(n)));
+    }
+}
+
 async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
     let me = leader(app);
     let (mut rd, wr) = stream.into_split();
@@ -238,11 +345,12 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
         return Err(std::io::Error::other("expected HELLO"));
     }
     let hello: Hello = proto::decode(&payload)?;
-    if hello.leader_region != app.cfg.leader_region {
+    if hello.leader_region != app.cfg.leader_region || hello.region == app.cfg.region {
         eprintln!(
-            "[repl] !!!!! CONFIG MISMATCH: follower {} believes the leader region is {}, but this leader is configured with {} — refusing link !!!!!",
+            "[repl] !!!!! CONFIG MISMATCH: follower {} believes the leader region is {}, but this leader ({}) is configured with {} — refusing link !!!!!",
             hello.region.as_str(),
             hello.leader_region.as_str(),
+            app.cfg.region.as_str(),
             app.cfg.leader_region.as_str()
         );
         return Err(std::io::Error::other("leader region mismatch"));
@@ -258,8 +366,14 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
         target: Mutex::new((0, 0)),
         kill: Notify::new(),
         dead: AtomicBool::new(false),
+        queue_bytes: AtomicU64::new(0),
+        max_ack_us: AtomicU64::new(0),
+        slow_acks: AtomicU64::new(0),
+        last_warn_us: AtomicU64::new(0),
+        connected_at: Instant::now(),
     });
-    // plan the catch-up and register atomically w.r.t. the sequencer (wal lock)
+    // plan the catch-up and register atomically w.r.t. the sequencer (wal lock): every record after `target`
+    // goes through the live queue (and is waited for by its writer).
     let (reset, from, target, epoch, offsets) = {
         let wal = app.wal.inner.lock();
         let same = hello.epoch == wal.epoch && hello.seq <= wal.last_seq && wal.crc_at(hello.seq) == hello.last_crc;
@@ -275,25 +389,24 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
         (!same, from, target, wal.epoch, (offsets, span))
     };
     eprintln!(
-        "[repl] link {id} from {} (epoch {:016x} seq {}) -> {} catch-up {}..={} of epoch {:016x}",
+        "[repl] link {id} from {} (epoch {:016x} seq {}) -> {}catch-up {}..={} of epoch {:016x}",
         hello.region.as_str(),
         hello.epoch,
         hello.seq,
-        if reset { "RESET +" } else { "" },
+        if reset { "RESET + " } else { "" },
         from,
         target,
         epoch
     );
 
-    // writer: reset/catch-up first, then the live queue
+    // writer: reset/catch-up first, then CAUGHT_UP, then the live queue
     let wlink = link.clone();
     let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
         let mut wr = wr;
         if reset {
             wr.write_all(&proto::frame_msg(proto::RESET, &Reset { epoch })).await?;
         }
-        let (offs, (start, end)) = offsets;
+        let (offs, (_start, end)) = offsets;
         let mut i = 0;
         while i < offs.len() {
             let cstart = offs[i];
@@ -302,7 +415,6 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
                 j += 1;
             }
             let cend = if j < offs.len() { offs[j] } else { end };
-            debug_assert!(cstart >= start);
             if app.wal.inner.lock().epoch != epoch {
                 return Err(std::io::Error::other("epoch changed during catch-up"));
             }
@@ -313,11 +425,9 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
             wr.write_all(&proto::frame(proto::RECORDS, &data)).await?;
             i = j;
         }
+        wr.write_all(&proto::frame_msg(proto::CAUGHT_UP, &Ack { epoch, seq: target })).await?;
         wr.flush().await?;
-        tokio::select! {
-            r = proto::writer_loop(wr, rx) => r,
-            _ = wlink.kill.notified() => Ok(()),
-        }
+        live_writer(wr, rx, wlink).await
     });
 
     // reader: acks + forwarded commands

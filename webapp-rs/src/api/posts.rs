@@ -54,7 +54,7 @@ pub async fn create_post(ctx: Ctx, mut req: Req) -> HResult {
         _ => return Err(invalid()),
     }
     // 6.–8. window / slot rules + creation (atomic on the leader)
-    let out = ctx.write(Command::CreatePost { actor: me.id, image, caption, visibility, location }).await?;
+    let out = ctx.write(Command::CreatePost { actor: me.id, image: image.into(), caption, visibility, location }).await?;
     ctx.respond(201, |st, w| {
         let p = st.post_idx(out.id()).ok_or_else(ApiError::internal_unknown)?;
         views::post(w, st, p, |_| {});
@@ -64,7 +64,7 @@ pub async fn create_post(ctx: Ctx, mut req: Req) -> HResult {
 }
 
 /// Emits `tx.push_blob(LogEntry::PostCreated { .. }, image.clone())`. Outcome::Id(post id).
-pub fn exec_create_post(st: &State, tx: &mut Tx, actor: Id, image: &Bytes, caption: &str, visibility: Visibility, location: &Location) -> ExecResult {
+pub fn exec_create_post(st: &State, tx: &mut Tx, actor: Id, image: &Blob, caption: &str, visibility: Visibility, location: &Location) -> ExecResult {
     let u = actor_idx(st, actor)?;
     let unavailable = || ApiError::conflict("post_slot_unavailable");
     let w = st.open_window_of(st.user(u).region).ok_or_else(unavailable)?;

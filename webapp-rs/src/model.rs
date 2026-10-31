@@ -425,8 +425,34 @@ pub struct FriendRequest {
 pub enum ImageLoc {
     /// initial image inside images.pack
     Pack { off: u64, len: u32 },
-    /// uploaded image stored inline in the local WAL file
+    /// small uploaded image stored inline in the local WAL file
     Wal { off: u64, len: u32 },
+    /// large uploaded image in this node's durable blob store (this node is its origin)
+    Blob { key: u64, off: u64, len: u32 },
+    /// large uploaded image living in another node's blob store (fetched on demand + cached locally)
+    Remote { origin: Region, key: u64, off: u64, len: u32 },
+}
+
+/// Reference to a large blob in its origin node's durable blob store (carried in the log instead of the bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub origin: Region,
+    /// random key also written in the blob's header (guards against reading a different blob)
+    pub key: u64,
+    /// offset of the data in the origin's blobs.dat
+    pub off: u64,
+    pub len: u32,
+}
+
+impl BlobRef {
+    /// Where this blob is read from on a node of region `me`.
+    pub fn loc_on(&self, me: Region) -> ImageLoc {
+        if self.origin == me {
+            ImageLoc::Blob { key: self.key, off: self.off, len: self.len }
+        } else {
+            ImageLoc::Remote { origin: self.origin, key: self.key, off: self.off, len: self.len }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

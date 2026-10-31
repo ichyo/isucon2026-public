@@ -31,6 +31,8 @@ enum Deny {
     BadSignature,
     /// 500 (missing bytes, I/O error)
     Internal(String),
+    /// 503 (the origin node of a large upload could not be reached in time; the benchmarker retries 503)
+    Unavailable(String),
 }
 
 // GET /api/images/{imageId}?exp=…&sig=… — no auth, not pinned.
@@ -45,6 +47,10 @@ pub async fn get_image(ctx: Ctx, req: Req) -> HResult {
         Err(Deny::Internal(msg)) => {
             eprintln!("[images] GET {} failed: {msg}", req.path);
             no_store(ApiError::internal(msg).into_resp())
+        }
+        Err(Deny::Unavailable(msg)) => {
+            eprintln!("[images] GET {} unavailable: {msg}", req.path);
+            no_store(ApiError::unavailable("image temporarily unavailable").into_resp())
         }
     })
 }
@@ -94,10 +100,17 @@ async fn serve(ctx: Ctx, image_id: &str, query: Option<&str>) -> Result<Bytes, D
     if exp <= now_s() {
         return Err(Forbidden);
     }
-    // 8. the stored bytes: straight from RAM when resident (no blocking-pool hop), else via the blocking pool
-    match ctx.images.try_read_cached(loc) {
+    // 8. the stored bytes: straight from RAM when resident (no blocking-pool hop), else via the blocking pool;
+    //    a large upload of another node is fetched from its origin (single-flight) and cached locally
+    match ctx.images.try_read_cached(img, loc) {
         Some(bytes) => Ok(bytes),
-        None => ctx.images.read(loc).await.map_err(|e| Deny::Internal(format!("read {loc:?}: {e}"))),
+        None => ctx.images.read(img, loc).await.map_err(|e| {
+            if crate::images::ImageStore::is_unavailable(loc, &e) {
+                Deny::Unavailable(format!("read {loc:?}: {e}"))
+            } else {
+                Deny::Internal(format!("read {loc:?}: {e}"))
+            }
+        }),
     }
 }
 

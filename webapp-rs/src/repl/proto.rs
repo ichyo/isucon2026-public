@@ -14,6 +14,10 @@ pub const ACK: u8 = 3;
 pub const RESET: u8 = 10;
 pub const RECORDS: u8 = 11;
 pub const RESPONSE: u8 = 12;
+/// L→F after the catch-up stream (payload: Ack{epoch, seq} = what the follower now has): it may serve reads
+pub const CAUGHT_UP: u8 = 13;
+/// L→F when the link is idle (keeps the follower's read lease alive)
+pub const HEARTBEAT: u8 = 14;
 
 pub const MAX_FRAME: usize = 96 << 20;
 

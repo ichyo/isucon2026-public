@@ -7,7 +7,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::apply::Effect;
 use crate::bans::Bans;
-use crate::command::{self, Command, Outcome, Tx};
+use crate::command::{self, Blob, Command, Outcome, Tx};
 use crate::config::Config;
 use crate::http::router::Router;
 use crate::http::{Abuse, ApiError, HResult, Req, Resp};
@@ -155,17 +155,28 @@ impl App {
         self.write_with(cmd, WaitPolicy::AllReplicas).await
     }
 
-    pub async fn write_with(&'static self, cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
+    pub async fn write_with(&'static self, mut cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
+        let big = matches!(cmd.blob(), Some(Blob::Inline(b)) if b.len() > self.cfg.blob_inline_max);
+        let dry = !matches!(cmd, Command::Initialize | Command::Ban { .. }) && (!self.is_leader() || big);
+        if dry {
+            // fail fast (no RTT, no blob write) on errors the local replica can already see
+            let st = self.read();
+            let mut tx = Tx::dry(now_us());
+            command::exec(&st, &mut tx, &cmd)?;
+        }
+        if big {
+            // large uploads stay on this (origin) node: durable before the write is submitted; the log only
+            // carries the reference, other nodes fetch the bytes on demand (blobs.rs)
+            if let Some(slot) = cmd.blob_mut() {
+                if let Blob::Inline(b) = slot {
+                    let r = self.images.blobs.put(b.clone(), self.cfg.region).await.map_err(|e| ApiError::internal(format!("blob store: {e}")))?;
+                    *slot = Blob::Stored(r);
+                }
+            }
+        }
         match &self.repl {
             Repl::Leader(l) => l.submit(self, cmd, crate::repl::Origin::Local, policy).await,
-            Repl::Follower(f) => {
-                if !matches!(cmd, Command::Initialize | Command::Ban { .. }) {
-                    let st = self.read();
-                    let mut tx = Tx::dry(now_us());
-                    command::exec(&st, &mut tx, &cmd)?;
-                }
-                f.forward(cmd).await
-            }
+            Repl::Follower(f) => f.forward(cmd).await,
         }
     }
 
@@ -211,7 +222,7 @@ impl App {
         let summary = self.read().summary();
         let (ms, fms) = self.throttle.get();
         format!(
-            "{{\"region\":\"{}\",\"leader_region\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"state\":\"{}\",\"throttle_ms\":{},\"throttle_feed_ms\":{},\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
+            "{{\"region\":\"{}\",\"leader_region\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"blobs\":{},\"state\":\"{}\",\"throttle_ms\":{},\"throttle_feed_ms\":{},\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
             self.cfg.region.as_str(),
             self.cfg.leader_region.as_str(),
             if self.is_leader() { "leader" } else { "follower" },
@@ -219,6 +230,7 @@ impl App {
             seq,
             end,
             self.repl.status_json(),
+            self.images.net.status_json(&self.images.blobs, &self.images.cache),
             summary,
             ms,
             fms,

@@ -221,7 +221,7 @@ pub(crate) mod testutil {
 
     pub fn post(st: &mut State, now: Ts, u: UIdx, vis: Visibility) -> Result<PIdx, ApiError> {
         let actor = st.user(u).id;
-        let out = run(st, now, Command::CreatePost { actor, image: Bytes::from_static(b"jpeg"), caption: String::new(), visibility: vis, location: Location::None })?;
+        let out = run(st, now, Command::CreatePost { actor, image: Bytes::from_static(b"jpeg").into(), caption: String::new(), visibility: vis, location: Location::None })?;
         Ok(st.post_idx(out.id()).unwrap())
     }
 }
