@@ -85,9 +85,8 @@ async fn serve(ctx: Ctx, image_id: &str, query: Option<&str>) -> Result<Bytes, D
     // 5. signature (cache hit for every URL this node rendered; a miss costs 1000 HMACs, off the runtime)
     let ok = match ctx.signer.verify_cached(img, exp, &sig) {
         Some(ok) => ok,
-        None => tokio::task::spawn_blocking(move || ctx.signer.verify(&key, img, exp, &sig))
-            .await
-            .map_err(|e| Deny::Internal(format!("verify: {e}")))?,
+        // miss: computed together with concurrent misses (one SIMD pass), cached + shared with the region peer
+        None => sign::ct_eq(&ctx.sigbatch.expected(&ctx.signer, img, key, exp).await, &sig),
     };
     if !ok {
         return Err(Deny::BadSignature);

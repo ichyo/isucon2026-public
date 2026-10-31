@@ -377,10 +377,29 @@ impl BlobNet {
         }
     }
 
+    /// Sends one fire-and-forget frame to a peer's blob service (connecting lazily). `false` if unreachable.
+    pub async fn send_frame(&self, peer: NodeId, ty: u8, payload: &[u8]) -> bool {
+        match self.conn(peer).await {
+            Ok(c) => {
+                if c.tx.send(proto::frame(ty, payload)).is_err() {
+                    c.dead.store(true, Ordering::SeqCst);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Waits until `node` has (directly) acked `(epoch, seq)`.
     pub async fn wait_peer_ack(&self, node: NodeId, epoch: u64, seq: u64) {
         let mut rx = self.peer_acks[node.idx()].subscribe();
         let _ = rx.wait_for(|&(e, s)| e == epoch && s >= seq).await;
+    }
+
+    pub fn has_peer(&self, n: NodeId) -> bool {
+        self.peers.lock()[n.idx()].is_some()
     }
 
     /// Changes a peer address (tests / local clusters with ephemeral ports).
@@ -564,7 +583,7 @@ impl BlobNet {
 }
 
 /// Blob service: serves this node's own `blobs.dat` to peers.
-pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, listener: TcpListener) {
+pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, signer: &'static crate::sign::Signer, listener: TcpListener) {
     loop {
         let (s, _peer) = match listener.accept().await {
             Ok(x) => x,
@@ -581,6 +600,12 @@ pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, listener: T
             let writer = tokio::spawn(proto::writer_loop(wr, rx));
             loop {
                 let Ok((ty, p)) = proto::read_frame(&mut rd).await else { break };
+                if ty == crate::sigshare::SIG_SHARE {
+                    if let Some(items) = crate::sigshare::decode(&p) {
+                        signer.insert_peer(&items);
+                    }
+                    continue;
+                }
                 if ty == ACK_BCAST && p.len() == 17 {
                     if let Some(n) = NodeId::from_u8(p[0]) {
                         let epoch = u64::from_le_bytes(p[1..9].try_into().unwrap());

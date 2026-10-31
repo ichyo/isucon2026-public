@@ -39,6 +39,8 @@ pub struct App {
     pub statics: StaticFiles,
     pub repl: Repl,
     pub metrics: crate::metrics::Metrics,
+    /// batches concurrent image-signature verification misses into SIMD passes
+    pub sigbatch: crate::sigshare::VerifyBatcher,
 }
 
 /// The authenticated session user (copied out of the state; safe to keep across awaits).

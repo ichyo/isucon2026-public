@@ -96,6 +96,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let app: &'static App = Box::leak(Box::new(App {
         throttle: Throttle::new(cfg.throttle_ms, cfg.throttle_feed_ms),
         signer: Signer::new(cfg.exp_quantum),
+        sigbatch: crate::sigshare::VerifyBatcher::default(),
         cfg,
         state: RwLock::new(live),
         pristine,
@@ -108,6 +109,9 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         statics,
         repl,
     }));
+
+    app.sigbatch.start(&app.signer);
+    crate::sigshare::spawn_sharing(app);
 
     // replay the local WAL
     {
@@ -160,7 +164,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     match crate::rt::spawn(async move { TcpListener::bind(&app.cfg.blob_listen).await }).await? {
         Ok(l) => {
             blob_addr = Some(l.local_addr()?);
-            crate::rt::spawn(crate::blobs::serve(&app.images.blobs, &app.images.net, l));
+            crate::rt::spawn(crate::blobs::serve(&app.images.blobs, &app.images.net, &app.signer, l));
         }
         Err(e) => eprintln!("[start] WARN cannot bind blob service {}: {e} (other nodes cannot fetch this node's uploads!)", app.cfg.blob_listen),
     }

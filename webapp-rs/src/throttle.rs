@@ -108,7 +108,13 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             repl["repl_priority"] = serde_json::json!(crate::rt::prio_state());
             repl["gate_silence_ms"] = serde_json::json!(app.cfg.gate_silence_ms);
             repl["async_actions"] = serde_json::json!(app.cfg.async_actions);
-            text(200, app.metrics.json_with(app.cfg.node.name(), role, repl))
+            let mut v: serde_json::Value = serde_json::from_str(&app.metrics.json_with(app.cfg.node.name(), role, repl)).unwrap_or_default();
+            let mut sigs = app.signer.stats_json();
+            if let (Some(a), serde_json::Value::Object(b)) = (sigs.as_object_mut(), crate::sigshare::stats_json()) {
+                a.extend(b);
+            }
+            v["signatures"] = sigs;
+            text(200, v.to_string())
         }
         ("POST", "/metrics/reset") => {
             app.metrics.reset();
