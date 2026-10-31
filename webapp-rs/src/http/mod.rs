@@ -69,7 +69,15 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|n| n > MAX_BODY as u64);
 
-    let resp: Resp = if too_large {
+    let resp: Resp = if parts.headers.contains_key(HEALTH_HEADER) && path == "/" {
+        // load-balancer health check (HAProxy on asia1): 200 only while this node may serve reads
+        action_id = metrics::A_HEALTH;
+        if follower_in_sync_now(app) {
+            Resp::bytes(200, "text/plain", "ok\n")
+        } else {
+            Resp::bytes(503, "text/plain", "not in sync\n")
+        }
+    } else if too_large {
         action_id = metrics::A_TOO_LARGE;
         ApiError::new(413, "Request Entity Too Large").into_resp()
     } else if app.bans.is_banned(&ip, now_us()) {
@@ -149,6 +157,16 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         eprintln!("[req] {} {} {} action={} ip={} {:.1?}", parts.method, path, resp.status, action, ip, start.elapsed());
     }
     Ok(to_hyper(resp))
+}
+
+/// Health-check request header (sent by the load balancer on `GET /`; never by real clients).
+pub const HEALTH_HEADER: &str = "x-isureal-health";
+
+fn follower_in_sync_now(app: &'static App) -> bool {
+    match &app.repl {
+        crate::repl::Repl::Follower(f) => f.in_sync(),
+        crate::repl::Repl::Leader(_) => true,
+    }
 }
 
 /// Followers hold API requests until they are in sync with the leader (bounded wait); the leader never waits.

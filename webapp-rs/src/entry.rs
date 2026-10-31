@@ -3,7 +3,7 @@
 //! Record = `[u32 len][u32 crc32(body)][body]`,
 //! body   = `[u64 seq][u32 meta_len][postcard(LogEntry)][u8 blob_kind]` +
 //!          kind 0: nothing | kind 1: `[u32 blob_len][blob]` | kind 2: `[u64 req_id]` (FromForward, wire only)
-//!          | kind 3: `[u8 origin][u64 key][u64 off][u32 len]` (large blob stored on its origin node).
+//!          | kind 3: `[u8 origin node][u64 key][u64 off][u32 len]` (large blob stored on its origin node).
 
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ pub fn encode_record(seq: u64, entry: &LogEntry, blob: BlobOut<'_>) -> (Vec<u8>,
         }
         BlobOut::Ref(r) => {
             out.push(3);
-            out.push(r.origin as u8);
+            out.push(r.origin.0);
             out.extend_from_slice(&r.key.to_le_bytes());
             out.extend_from_slice(&r.off.to_le_bytes());
             out.extend_from_slice(&r.len.to_le_bytes());
@@ -174,11 +174,8 @@ pub fn decode_record(buf: &[u8]) -> Result<Decoded, DecodeErr> {
             if body.len() != kpos + 22 {
                 return Err(DecodeErr::Corrupt("ref"));
             }
-            let origin = match body[kpos + 1] {
-                0 => Region::Asia,
-                1 => Region::Europe,
-                2 => Region::America,
-                _ => return Err(DecodeErr::Corrupt("ref origin")),
+            let Some(origin) = NodeId::from_u8(body[kpos + 1]) else {
+                return Err(DecodeErr::Corrupt("ref origin"));
             };
             BlobIn::Ref(BlobRef {
                 origin,
@@ -208,7 +205,7 @@ mod tests {
         assert_eq!(&r[o..o + len], b"JPEGDATA");
         let (r2, _) = encode_record(8, &e, BlobOut::FromForward(99));
         assert_eq!(decode_record(&r2).unwrap().blob, BlobIn::FromForward(99));
-        let br = BlobRef { origin: Region::America, key: 0xdead_beef, off: 1 << 33, len: 500_000 };
+        let br = BlobRef { origin: NodeId::ASIA2, key: 0xdead_beef, off: 1 << 33, len: 500_000 };
         let (r3, off3) = encode_record(9, &e, BlobOut::Ref(br));
         assert_eq!(off3, None);
         assert_eq!(decode_record(&r3).unwrap().blob, BlobIn::Ref(br));

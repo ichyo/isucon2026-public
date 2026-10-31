@@ -158,7 +158,7 @@ impl App {
 
     pub async fn write_with(&'static self, mut cmd: Command, policy: WaitPolicy) -> Result<Outcome, ApiError> {
         let big = matches!(cmd.blob(), Some(Blob::Inline(b)) if b.len() > self.cfg.blob_inline_max);
-        let dry = !matches!(cmd, Command::Initialize | Command::Ban { .. }) && (!self.is_leader() || big);
+        let dry = !matches!(cmd, Command::Initialize | Command::Ban { .. } | Command::AbuseReport { .. }) && (!self.is_leader() || big);
         if dry {
             // fail fast (no RTT, no blob write) on errors the local replica can already see
             let st = self.read();
@@ -170,7 +170,7 @@ impl App {
             // carries the reference, other nodes fetch the bytes on demand (blobs.rs)
             if let Some(slot) = cmd.blob_mut() {
                 if let Blob::Inline(b) = slot {
-                    let r = self.images.blobs.put(b.clone(), self.cfg.region).await.map_err(|e| ApiError::internal(format!("blob store: {e}")))?;
+                    let r = self.images.blobs.put(b.clone(), self.cfg.node).await.map_err(|e| ApiError::internal(format!("blob store: {e}")))?;
                     *slot = Blob::Stored(r);
                 }
             }
@@ -197,17 +197,41 @@ impl App {
     }
 
     /// Feeds the ban detector; on a ban, enforces it locally at once and replicates it asynchronously.
+    ///
+    /// Detection runs locally (immediate local ban) and, on the leader, over the events of *all* nodes:
+    /// followers report each event (`Command::AbuseReport`), so traffic of one IP spread over several nodes of
+    /// a region (asia1 + asia2 behind HAProxy) still reaches the thresholds.
     pub fn on_abuse(&'static self, ip: &str, a: Abuse) {
-        if let Some(until) = self.bans.record(ip, a, now_us()) {
-            eprintln!("[ban] {ip} banned until {} ({a:?})", crate::timefmt::format_ts(until));
-            self.bans.set(ip, until);
-            let ip = ip.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = self.write(Command::Ban { ip, until }).await {
-                    eprintln!("[ban] replicate failed: {} {}", e.status, e.code);
+        match &self.repl {
+            Repl::Leader(_) => self.count_abuse_globally(ip, a),
+            Repl::Follower(f) => {
+                if let Some(until) = self.bans.record(ip, a, now_us()) {
+                    self.ban(ip, until, a);
                 }
-            });
+                let cmd = Command::AbuseReport { ip: ip.to_string(), abuse: a };
+                tokio::spawn(async move {
+                    let _ = f.forward(cmd).await;
+                });
+            }
         }
+    }
+
+    /// Leader: one abuse event of any node.
+    pub fn count_abuse_globally(&'static self, ip: &str, a: Abuse) {
+        if let Some(until) = self.bans.record(ip, a, now_us()) {
+            self.ban(ip, until, a);
+        }
+    }
+
+    fn ban(&'static self, ip: &str, until: Ts, a: Abuse) {
+        eprintln!("[ban] {ip} banned until {} ({a:?}) by {}", crate::timefmt::format_ts(until), self.cfg.node.name());
+        self.bans.set(ip, until);
+        let ip = ip.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = self.write(Command::Ban { ip, until }).await {
+                eprintln!("[ban] replicate failed: {} {}", e.status, e.code);
+            }
+        });
     }
 
     /// Resets the local state to the pristine dataset (used by initialize on every node).
@@ -228,9 +252,10 @@ impl App {
         let summary = self.read().summary();
         let (ms, fms) = self.throttle.get();
         format!(
-            "{{\"region\":\"{}\",\"leader_region\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"blobs\":{},\"state\":\"{}\",\"throttle_ms\":{},\"throttle_feed_ms\":{},\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
+            "{{\"node\":\"{}\",\"region\":\"{}\",\"leader_node\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"blobs\":{},\"state\":\"{}\",\"throttle_ms\":{},\"throttle_feed_ms\":{},\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
+            self.cfg.node.name(),
             self.cfg.region.as_str(),
-            self.cfg.leader_region.as_str(),
+            self.cfg.leader_node.name(),
             if self.is_leader() { "leader" } else { "follower" },
             epoch,
             seq,

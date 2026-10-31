@@ -177,9 +177,9 @@ pub async fn run(app: &'static App) {
             Err(e) => {
                 if !logged_down {
                     eprintln!(
-                        "[repl] cannot connect to leader {} (leader region {}): {e} (retrying every {:?}; not serving meanwhile)",
+                        "[repl] cannot connect to leader {} (leader node {}): {e} (retrying every {:?}; not serving meanwhile)",
                         app.cfg.leader_addr,
-                        app.cfg.leader_region.as_str(),
+                        app.cfg.leader_node.name(),
                         RECONNECT_DELAY
                     );
                     logged_down = true;
@@ -198,7 +198,7 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
         let w = app.wal.inner.lock();
         (w.epoch, w.last_seq, w.lsn, w.last_crc())
     };
-    let hello = Hello { region: app.cfg.region, leader_region: app.cfg.leader_region, epoch, seq, last_crc: crc };
+    let hello = Hello { node: app.cfg.node, region: app.cfg.region, leader_node: app.cfg.leader_node, epoch, seq, last_crc: crc };
     wr.write_all(&proto::frame_msg(proto::HELLO, &hello)).await?;
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
     let writer = tokio::spawn(proto::writer_loop(wr, rx));
@@ -307,7 +307,7 @@ fn apply_records(app: &'static App, f: &Follower, payload: &[u8]) -> std::io::Re
         let (bytes, loc): (std::borrow::Cow<'_, [u8]>, Loc) = match d.blob {
             BlobIn::None => (rec.into(), Loc::None),
             BlobIn::Inline { off, len } => (rec.into(), Loc::InRecord { off: off as u64, len: len as u32 }),
-            BlobIn::Ref(r) => (rec.into(), Loc::At(r.loc_on(app.cfg.region))),
+            BlobIn::Ref(r) => (rec.into(), Loc::At(r.loc_on(app.cfg.node))),
             BlobIn::FromForward(req) => {
                 let Some(b) = f.blob_of(req) else {
                     return Err(std::io::Error::other(format!("blob of forward {req} unavailable")));

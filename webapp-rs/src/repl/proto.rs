@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::command::{Command, Outcome};
 use crate::http::ApiError;
-use crate::model::Region;
+use crate::model::{NodeId, Region};
 
 pub const HELLO: u8 = 1;
 pub const FORWARD: u8 = 2;
@@ -23,8 +23,9 @@ pub const MAX_FRAME: usize = 96 << 20;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Hello {
+    pub node: NodeId,
     pub region: Region,
-    pub leader_region: Region,
+    pub leader_node: NodeId,
     pub epoch: u64,
     pub seq: u64,
     pub last_crc: u32,

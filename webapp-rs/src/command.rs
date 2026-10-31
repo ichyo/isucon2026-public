@@ -46,6 +46,9 @@ pub enum Command {
     Initialize,
     /// IP ban detected on some node
     Ban { ip: String, until: Ts },
+    /// one abuse event seen by a follower, aggregated cluster-wide by the leader (two asia nodes behind a load
+    /// balancer each see only part of an IP's traffic); not a log entry
+    AbuseReport { ip: String, abuse: crate::http::Abuse },
     /// control-port debug hook: create a session for a user (like a login without the secret)
     DebugSession { user: Id },
 
@@ -102,6 +105,7 @@ impl Command {
         match self {
             Command::Initialize => "initialize",
             Command::Ban { .. } => "ban",
+            Command::AbuseReport { .. } => "abuse_report",
             Command::DebugSession { .. } => "debug_session",
             Command::Register { .. } => "register",
             Command::Login { .. } => "login",
@@ -196,6 +200,8 @@ pub fn exec(st: &State, tx: &mut Tx, cmd: &Command) -> ExecResult {
             tx.push(LogEntry::IpBanned { ip: ip.clone(), until: *until });
             Ok(Outcome::Unit)
         }
+        // handled by the leader before exec (Leader::submit); nothing to log
+        Command::AbuseReport { .. } => Ok(Outcome::Unit),
         Command::DebugSession { user } => {
             let u = st.user_idx(*user).filter(|&u| st.user(u).is_active()).ok_or(ApiError::not_found("account_not_found"))?;
             let token = tx.new_id();

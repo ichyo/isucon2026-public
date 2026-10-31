@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::model::{BlobRef, Id, Region};
+use crate::model::{BlobRef, Id, NodeId};
 use crate::repl::proto;
 
 pub const HDR: u64 = 16;
@@ -121,7 +121,7 @@ impl BlobStore {
     }
 
     /// Stores `data` durably (fsynced when enabled) and returns its reference.
-    pub async fn put(&'static self, data: Bytes, origin: Region) -> io::Result<BlobRef> {
+    pub async fn put(&'static self, data: Bytes, origin: NodeId) -> io::Result<BlobRef> {
         let key = rand_u64();
         let len = data.len() as u32;
         let (off, lsn) = tokio::task::spawn_blocking(move || -> io::Result<(u64, u64)> {
@@ -319,15 +319,15 @@ pub struct NetStats {
 }
 
 pub struct BlobNet {
-    peers: Mutex<[Option<String>; 3]>,
-    conns: [tokio::sync::Mutex<Option<Arc<ClientConn>>>; 3],
+    peers: Mutex<[Option<String>; NodeId::COUNT]>,
+    conns: [tokio::sync::Mutex<Option<Arc<ClientConn>>>; NodeId::COUNT],
     inflight: Mutex<FxHashMap<Id, Vec<oneshot::Sender<FetchResult>>>>,
     next_req: AtomicU64,
     pub stats: NetStats,
 }
 
 impl BlobNet {
-    pub fn new(peers: [Option<String>; 3]) -> BlobNet {
+    pub fn new(peers: [Option<String>; NodeId::COUNT]) -> BlobNet {
         BlobNet {
             peers: Mutex::new(peers),
             conns: Default::default(),
@@ -338,18 +338,18 @@ impl BlobNet {
     }
 
     /// Changes a peer address (tests / local clusters with ephemeral ports).
-    pub fn set_peer(&self, r: Region, addr: String) {
-        self.peers.lock()[r.idx()] = Some(addr);
+    pub fn set_peer(&self, n: NodeId, addr: String) {
+        self.peers.lock()[n.idx()] = Some(addr);
     }
 
-    async fn conn(&self, origin: Region) -> Result<Arc<ClientConn>, String> {
+    async fn conn(&self, origin: NodeId) -> Result<Arc<ClientConn>, String> {
         let mut slot = self.conns[origin.idx()].lock().await;
         if let Some(c) = slot.as_ref() {
             if !c.dead.load(Ordering::SeqCst) {
                 return Ok(c.clone());
             }
         }
-        let addr = self.peers.lock()[origin.idx()].clone().ok_or_else(|| format!("no blob peer for {}", origin.as_str()))?;
+        let addr = self.peers.lock()[origin.idx()].clone().ok_or_else(|| format!("no blob peer for {}", origin.name()))?;
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
             .await
             .map_err(|_| format!("connect {addr}: timeout"))?
@@ -388,7 +388,7 @@ impl BlobNet {
         Ok(c)
     }
 
-    async fn fetch_once(&self, origin: Region, key: u64, off: u64, len: u32, timeout: Duration) -> FetchResult {
+    async fn fetch_once(&self, origin: NodeId, key: u64, off: u64, len: u32, timeout: Duration) -> FetchResult {
         let c = self.conn(origin).await?;
         let req = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -408,7 +408,7 @@ impl BlobNet {
             Ok(Err(_)) => Err("blob connection closed".into()),
             Err(_) => {
                 c.pending.lock().remove(&req);
-                Err(format!("fetch from {} timed out", origin.as_str()))
+                Err(format!("fetch from {} timed out", origin.name()))
             }
         }
     }
@@ -416,7 +416,7 @@ impl BlobNet {
     /// Fetches a remote blob and stores it in `cache`. Single-flight per image id: the transfer runs in a
     /// background task that is NOT cancelled when a waiting request gives up (`FETCH_TIMEOUT` ⇒ that request
     /// answers 503; a retry then joins the same transfer or hits the cache).
-    pub async fn fetch(&'static self, cache: &'static BlobCache, id: Id, origin: Region, key: u64, off: u64, len: u32) -> FetchResult {
+    pub async fn fetch(&'static self, cache: &'static BlobCache, id: Id, origin: NodeId, key: u64, off: u64, len: u32) -> FetchResult {
         enum Step {
             Cached(u64, u32),
             Wait(oneshot::Receiver<FetchResult>, bool),
@@ -466,7 +466,7 @@ impl BlobNet {
                     }
                     Err(e) => {
                         self.stats.fetch_errors.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[blobs] fetch of {id} from {} failed: {e}", origin.as_str());
+                        eprintln!("[blobs] fetch of {id} from {} failed: {e}", origin.name());
                     }
                 }
                 let waiters = self.inflight.lock().remove(&id).unwrap_or_default();
@@ -482,7 +482,7 @@ impl BlobNet {
             Ok(Err(_)) => Err("fetch abandoned".into()),
             Err(_) => {
                 self.stats.wait_timeouts.fetch_add(1, Ordering::Relaxed);
-                Err(format!("fetch from {} still in progress after {:?}", origin.as_str(), FETCH_TIMEOUT))
+                Err(format!("fetch from {} still in progress after {:?}", origin.name(), FETCH_TIMEOUT))
             }
         }
     }
@@ -572,13 +572,14 @@ pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, listener: T
     }
 }
 
-/// Parses `asia=host:port,europe=host:port,america=host:port`.
-pub fn parse_peers(s: &str) -> anyhow::Result<[Option<String>; 3]> {
-    let mut out: [Option<String>; 3] = Default::default();
+/// Parses `asia1=host:port,asia2=host:port,europe1=host:port,america1=host:port` (a bare region name means that
+/// region's primary node).
+pub fn parse_peers(s: &str) -> anyhow::Result<[Option<String>; NodeId::COUNT]> {
+    let mut out: [Option<String>; NodeId::COUNT] = Default::default();
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (r, a) = part.split_once('=').ok_or_else(|| anyhow::anyhow!("bad blob peer {part:?}"))?;
-        let r = Region::parse(r.trim()).ok_or_else(|| anyhow::anyhow!("bad region in blob peer {part:?}"))?;
-        out[r.idx()] = Some(a.trim().to_string());
+        let (n, a) = part.split_once('=').ok_or_else(|| anyhow::anyhow!("bad blob peer {part:?}"))?;
+        let n = NodeId::parse(n.trim()).ok_or_else(|| anyhow::anyhow!("bad node in blob peer {part:?}"))?;
+        out[n.idx()] = Some(a.trim().to_string());
     }
     Ok(out)
 }
