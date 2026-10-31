@@ -64,8 +64,12 @@ pub fn decode_full_sync(data: &[u8]) -> Option<Dims> {
 
 /// Decode in the blocking pool, at most `ISUREAL_JPEG_CONCURRENCY` at a time (CPU budget, rt.rs).
 pub async fn decode(data: Bytes) -> Option<Dims> {
+    let t0 = std::time::Instant::now();
     let _permit = crate::rt::jpeg_permits().acquire().await.ok()?;
-    tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten()
+    let t1 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten();
+    crate::metrics::add_jpeg(t1 - t0, t1.elapsed());
+    r
 }
 
 /// Entropy-decode-only validator mirroring jpeg-decoder 0.3.2 (`decoder.rs`, `parser.rs`, `huffman.rs`).

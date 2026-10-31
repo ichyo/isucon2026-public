@@ -137,6 +137,7 @@ impl Req {
                 return Err(ApiError::bind(format!("read body: {e}")));
             }
         };
+        crate::metrics::set_body_recv(self.start.elapsed());
         self.body_bytes = Some(b.clone());
         Ok(b)
     }
