@@ -12,6 +12,30 @@ use crate::state::State;
 
 type Job = (Id, [u8; 32]);
 const CHUNK: usize = 64;
+const FRESH_BATCH: usize = 16;
+const FRESH_COLLECT: Duration = Duration::from_millis(1);
+
+/// A burst of freshly replicated images should fill SIMD lanes instead of running one scalar-sized
+/// pass per image. Bound the wait from the first image, so an isolated write adds at most 1 ms.
+fn collect_fresh(rx: &Receiver<Job>, first: Job) -> Vec<Job> {
+    let deadline = Instant::now() + FRESH_COLLECT;
+    let mut batch = Vec::with_capacity(FRESH_BATCH);
+    batch.push(first);
+    while batch.len() < FRESH_BATCH {
+        // Already queued work adds no coalescing wait, even if this thread was descheduled.
+        match rx.try_recv() {
+            Ok(job) => { batch.push(job); continue; }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
+        match rx.recv_timeout(remaining) {
+            Ok(job) => batch.push(job),
+            Err(_) => break,
+        }
+    }
+    batch
+}
 
 pub struct Warmer {
     tx: SyncSender<Job>,
@@ -24,6 +48,8 @@ pub struct Warmer {
     total: AtomicU64,
     elapsed_ms: AtomicU64,
     new_images: AtomicU64,
+    new_batches: AtomicU64,
+    new_compute_us: AtomicU64,
     dropped: AtomicU64,
     changed: tokio::sync::Notify,
 }
@@ -42,6 +68,8 @@ impl Default for Warmer {
             total: AtomicU64::new(0),
             elapsed_ms: AtomicU64::new(0),
             new_images: AtomicU64::new(0),
+            new_batches: AtomicU64::new(0),
+            new_compute_us: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
         }
@@ -100,14 +128,18 @@ impl Warmer {
         }
     }
 
-    fn fresh(&self, app: &App, job: Job) {
+    fn fresh_many(&self, app: &App, jobs: &[Job]) {
+        if jobs.is_empty() { return; }
+        let started = Instant::now();
         let exp = app.signer.exp_for(now_us() / 1_000_000);
-        app.signer.sign_many_serial(&[job], exp);
+        app.signer.sign_many_serial(jobs, exp);
         let next = self.target_exp.load(Relaxed);
         if next > exp {
-            app.signer.precompute(&[job], next);
+            app.signer.precompute(jobs, next);
         }
-        self.new_images.fetch_add(1, Relaxed);
+        self.new_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        self.new_images.fetch_add(jobs.len() as u64, Relaxed);
+        self.new_batches.fetch_add(1, Relaxed);
     }
 
     fn run(&self, app: &'static App, rx: Receiver<Job>) {
@@ -140,9 +172,8 @@ impl Warmer {
                             continue 'generations;
                         }
                         // New images are few and latency-sensitive; bulk warmup never delays them by more than a chunk.
-                        for job in rx.try_iter().take(CHUNK) {
-                            self.fresh(app, job);
-                        }
+                        let fresh: Vec<_> = rx.try_iter().take(FRESH_BATCH).collect();
+                        self.fresh_many(app, &fresh);
                         app.signer.precompute(chunk, target);
                         let n = self.scanned.fetch_add(chunk.len() as u64, Relaxed) + chunk.len() as u64;
                         if n >= core as u64 && self.core_exp.load(Relaxed) < target {
@@ -159,7 +190,7 @@ impl Warmer {
                 }
             }
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(job) => self.fresh(app, job),
+                Ok(job) => self.fresh_many(app, &collect_fresh(&rx, job)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -190,10 +221,15 @@ impl Warmer {
     }
 
     pub fn stats_json(&self) -> serde_json::Value {
+        let new_images = self.new_images.load(Relaxed);
+        let new_batches = self.new_batches.load(Relaxed);
         serde_json::json!({"enabled": self.enabled, "target_exp": self.target_exp.load(Relaxed),
             "core_exp": self.core_exp.load(Relaxed), "complete_exp": self.complete_exp.load(Relaxed),
             "scanned": self.scanned.load(Relaxed), "total": self.total.load(Relaxed),
-            "elapsed_ms": self.elapsed_ms.load(Relaxed), "new_images": self.new_images.load(Relaxed),
+            "elapsed_ms": self.elapsed_ms.load(Relaxed), "new_images": new_images,
+            "new_batches": new_batches,
+            "new_batch_avg_images": if new_batches == 0 { 0.0 } else { new_images as f64 / new_batches as f64 },
+            "new_compute_ms": self.new_compute_us.load(Relaxed) as f64 / 1000.0,
             "dropped": self.dropped.load(Relaxed)})
     }
 }
@@ -202,6 +238,19 @@ impl Warmer {
 mod tests {
     use super::*;
     use rustc_hash::FxHashMap;
+
+    #[test]
+    fn fresh_batches_are_bounded_and_preserve_remaining_images() {
+        let (tx, rx) = mpsc::sync_channel(32);
+        let jobs: Vec<_> = (0..20).map(|i| (Id::new_v4(), [i; 32])).collect();
+        for job in &jobs { tx.send(*job).unwrap(); }
+        drop(tx);
+        let batch = collect_fresh(&rx, rx.recv().unwrap());
+        assert_eq!(batch, jobs[..FRESH_BATCH]);
+        let tail = collect_fresh(&rx, rx.recv().unwrap());
+        assert_eq!(tail, jobs[FRESH_BATCH..]);
+        assert!(rx.try_recv().is_err());
+    }
 
     fn fixture() -> State {
         let dir = std::env::temp_dir().join(format!("isureal-sigwarm-test-{}", Id::new_v4()));
