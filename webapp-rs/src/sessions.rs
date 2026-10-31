@@ -216,79 +216,118 @@ pub async fn handle(app: &'static App, request: Request) -> Result<Reply, ApiErr
         return Ok(Reply::Auth { user, region: usr.region });
     }
     let op = request.op.clone();
-    // Hold the state read guard until the journal is durable. Initialize/deletion/transfer cannot
-    // interleave validation and publication; disk I/O stays off the async executor.
+    // The per-user guard preserves operation order, but unrelated state updates must not wait for
+    // session disk I/O. Capture the ownership fence and metadata LSN, then drop the state guard.
     let result = tokio::task::spawn_blocking(move || -> Result<Local, ApiError> {
-        ready(app)?;
-        let st = app.read();
-        if st.epoch != request.epoch {
-            return Err(changed());
-        }
-        let u = st.user_idx(user).filter(|&u| st.user(u).is_active()).ok_or_else(invalid)?;
-        let usr = st.user(u);
-        let owner = NodeId::primary(usr.region);
-        if owner != app.cfg.node {
-            return Ok(Local::Reply(Reply::Redirect { node: owner, user }));
-        }
-        let token = current(app, st.epoch, usr);
-        let out = match op {
-            Operation::Validate { token: presented } => {
-                if token != Some(presented) {
-                    return Err(invalid());
-                }
-                return Ok(Local::Reply(Reply::Auth { user, region: usr.region }));
+        let (fence, mutation) = {
+            ready(app)?;
+            let st = app.read();
+            if st.epoch != request.epoch {
+                return Err(changed());
             }
-            Operation::Logout { token: presented } => {
-                if token != Some(presented) {
-                    return Err(invalid());
-                }
-                app.session_store.set(st.epoch, user, usr.session_generation, None).map_err(ApiError::internal)?;
-                Outcome::Unit
+            let u = st.user_idx(user).filter(|&u| st.user(u).is_active()).ok_or_else(invalid)?;
+            let usr = st.user(u);
+            let owner = NodeId::primary(usr.region);
+            if owner != app.cfg.node {
+                return Ok(Local::Reply(Reply::Redirect { node: owner, user }));
             }
-            Operation::Login { username, secret_key } => {
-                let Outcome::Login { user: found, .. } = crate::api::auth::exec_login(&st, &mut Tx::dry(now_us()), &username, &secret_key)? else {
-                    return Err(ApiError::internal_unknown());
-                };
-                if found != user {
-                    return Err(invalid());
+            let token = current(app, st.epoch, usr);
+            let mutation = match op {
+                Operation::Validate { .. } => unreachable!("validation handled above"),
+                Operation::Logout { token: presented } => {
+                    if token != Some(presented) {
+                        return Err(invalid());
+                    }
+                    Mutation::Set(None, Outcome::Unit)
                 }
-                let token = new_token(usr.region);
-                app.session_store.set(st.epoch, user, usr.session_generation, Some(token)).map_err(ApiError::internal)?;
-                Outcome::Login { user, token }
-            }
-            Operation::Debug => {
-                let token = new_token(usr.region);
-                app.session_store.set(st.epoch, user, usr.session_generation, Some(token)).map_err(ApiError::internal)?;
-                Outcome::Login { user, token }
-            }
-            Operation::Profile { region, display_name, bio } => {
-                if region == usr.region {
-                    return Ok(Local::Global(Command::UpdateProfile { user, display_name, bio, region: None }));
+                Operation::Login { username, secret_key } => {
+                    let Outcome::Login { user: found, .. } = crate::api::auth::exec_login(&st, &mut Tx::dry(now_us()), &username, &secret_key)? else {
+                        return Err(ApiError::internal_unknown());
+                    };
+                    if found != user {
+                        return Err(invalid());
+                    }
+                    let token = new_token(usr.region);
+                    Mutation::Set(Some(token), Outcome::Login { user, token })
                 }
-                let cmd =
-                    Command::MoveSession { epoch: st.epoch, user, from: usr.region, generation: usr.session_generation, token, region, display_name, bio };
-                app.session_store.freeze(st.epoch, user, usr.session_generation, cmd.clone()).map_err(ApiError::internal)?;
-                return Ok(Local::Global(cmd));
+                Operation::Debug => {
+                    let token = new_token(usr.region);
+                    Mutation::Set(Some(token), Outcome::Login { user, token })
+                }
+                Operation::Profile { region, display_name, bio } => {
+                    if region == usr.region {
+                        return Ok(Local::Global(Command::UpdateProfile { user, display_name, bio, region: None }));
+                    }
+                    Mutation::Freeze(Command::MoveSession {
+                        epoch: st.epoch, user, from: usr.region, generation: usr.session_generation,
+                        token, region, display_name, bio,
+                    })
+                }
+            };
+            // Creation/handoff metadata can be visible before its WAL fsync. Capture its LSN while
+            // the metadata is fenced so a successful session mutation survives together with it.
+            let fence = Fence {
+                epoch: st.epoch, generation: usr.session_generation, region: usr.region,
+                lsn: app.wal.inner.lock().lsn,
+            };
+            (fence, mutation)
+        };
+        let result = match mutation {
+            Mutation::Set(token, out) => {
+                app.session_store.set(fence.epoch, user, fence.generation, token).map_err(ApiError::internal)?;
+                Local::Durable(Reply::Outcome(out), fence)
+            }
+            Mutation::Freeze(cmd) => {
+                app.session_store.freeze(fence.epoch, user, fence.generation, cmd.clone()).map_err(ApiError::internal)?;
+                Local::Global(cmd)
             }
         };
-        // Creation/handoff metadata may have been applied before its fsync completed. A successful
-        // session mutation must survive together with the metadata that gives it meaning.
-        let lsn = app.wal.inner.lock().lsn;
-        Ok(Local::Durable(Reply::Outcome(out), lsn))
+        // Old epoch/generation records are harmless, but must never yield a successful response
+        // after initialize, deletion, or an ownership handoff has won the race.
+        fence.check(app, user)?;
+        Ok(result)
     })
     .await
     .map_err(ApiError::internal)??;
     match result {
         Local::Reply(reply) => Ok(reply),
-        Local::Durable(reply, lsn) => {
-            app.wal.wait_synced(lsn).await;
+        Local::Durable(reply, fence) => {
+            app.wal.wait_synced(fence.lsn).await;
+            fence.check(app, user)?;
             Ok(reply)
         }
         Local::Global(cmd) => Ok(Reply::Outcome(app.write_replicated(cmd, WaitPolicy::AllReplicas).await?)),
     }
 }
+
+#[derive(Clone, Copy)]
+struct Fence {
+    epoch: u64,
+    generation: u64,
+    region: Region,
+    lsn: u64,
+}
+impl Fence {
+    fn check(self, app: &App, user: Id) -> Result<(), ApiError> {
+        ready(app)?;
+        let st = app.read();
+        if st.epoch != self.epoch {
+            return Err(changed());
+        }
+        let u = st.user_idx(user).filter(|&u| st.user(u).is_active()).ok_or_else(invalid)?;
+        let usr = st.user(u);
+        if usr.session_generation != self.generation || usr.region != self.region || NodeId::primary(usr.region) != app.cfg.node {
+            return Err(changed());
+        }
+        Ok(())
+    }
+}
+enum Mutation {
+    Set(Option<Id>, Outcome),
+    Freeze(Command),
+}
 enum Local {
     Reply(Reply),
-    Durable(Reply, u64),
+    Durable(Reply, Fence),
     Global(Command),
 }

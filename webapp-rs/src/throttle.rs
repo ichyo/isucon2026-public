@@ -135,6 +135,7 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             }
             sigs["warmup"] = app.sigwarm.stats_json();
             v["signatures"] = sigs;
+            v["session_journal"] = serde_json::json!(app.session_store.stats());
             v["memory"] = memory_json();
             text(200, v.to_string())
         }

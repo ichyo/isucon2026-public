@@ -24,6 +24,8 @@ pub mod server;
 pub mod session_net;
 pub mod session_store;
 pub mod sessions;
+#[cfg(test)]
+mod session_races;
 pub mod sha256mb;
 pub mod sign;
 pub mod sigshare;
