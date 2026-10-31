@@ -7,6 +7,7 @@ pub mod apply;
 pub mod bans;
 pub mod blobs;
 pub mod command;
+pub mod compressionlog;
 pub mod config;
 pub mod entry;
 pub mod http;
