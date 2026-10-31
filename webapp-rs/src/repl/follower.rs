@@ -52,13 +52,6 @@ pub struct Follower {
     caught_up: AtomicBool,
     resetting: AtomicBool,
     last_frame_us: AtomicU64,
-    reconnects: AtomicU64,
-    gate_waits: AtomicU64,
-    gate_503: AtomicU64,
-    /// ACK_MODE=direct: forwarded writes completed from direct acks / left to the leader's RESPONSE
-    early_done: AtomicU64,
-    early_fallback: AtomicU64,
-    early_wait_us: AtomicU64,
     lease_us: u64,
 }
 
@@ -72,12 +65,6 @@ impl Follower {
             caught_up: AtomicBool::new(false),
             resetting: AtomicBool::new(false),
             last_frame_us: AtomicU64::new(0),
-            reconnects: AtomicU64::new(0),
-            gate_waits: AtomicU64::new(0),
-            gate_503: AtomicU64::new(0),
-            early_done: AtomicU64::new(0),
-            early_fallback: AtomicU64::new(0),
-            early_wait_us: AtomicU64::new(0),
             lease_us: gate_silence_ms.max(1) * 1000,
         }
     }
@@ -126,7 +113,6 @@ impl Follower {
         if self.in_sync() {
             return true;
         }
-        self.gate_waits.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + max;
         loop {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -134,7 +120,6 @@ impl Follower {
                 return true;
             }
             if Instant::now() >= deadline {
-                self.gate_503.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
@@ -142,22 +127,11 @@ impl Follower {
 
     pub fn status_json(&self) -> String {
         format!(
-            "{{\"connected\":{},\"caught_up\":{},\"resetting\":{},\"in_sync\":{},\"last_frame_ms_ago\":{:.1},\"pending_forwards\":{},\"reconnects\":{},\"gate_waits\":{},\"gate_503\":{},\"direct_done\":{},\"direct_fallback\":{},\"direct_avg_ms\":{:.1}}}",
+            "{{\"connected\":{},\"caught_up\":{},\"resetting\":{},\"in_sync\":{}}}",
             self.is_connected(),
             self.caught_up.load(Ordering::SeqCst),
             self.resetting.load(Ordering::SeqCst),
             self.in_sync(),
-            mono_us().saturating_sub(self.last_frame_us.load(Ordering::SeqCst)) as f64 / 1000.0,
-            self.pending.lock().len(),
-            self.reconnects.load(Ordering::Relaxed),
-            self.gate_waits.load(Ordering::Relaxed),
-            self.gate_503.load(Ordering::Relaxed),
-            self.early_done.load(Ordering::Relaxed),
-            self.early_fallback.load(Ordering::Relaxed),
-            {
-                let n = self.early_done.load(Ordering::Relaxed);
-                if n == 0 { 0.0 } else { self.early_wait_us.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0 }
-            }
         )
     }
 
@@ -193,13 +167,11 @@ pub async fn run(app: &'static App) {
             Ok(s) => {
                 logged_down = false;
                 let _ = s.set_nodelay(true);
-                eprintln!("[repl] connected to leader {}", app.cfg.leader_addr);
                 let r = session(app, s).await;
                 f.connected.store(false, Ordering::SeqCst);
                 f.caught_up.store(false, Ordering::SeqCst);
                 *f.conn.lock() = None;
                 f.fail_all_pending();
-                f.reconnects.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[repl] leader connection closed (not serving until back in sync): {:?}", r.err());
             }
             Err(e) => {
@@ -267,7 +239,6 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
                     // the records of this write precede this frame on the connection: already applied here
                     let m: Early = proto::decode(&payload)?;
                     let lsn = app.wal.inner.lock().lsn;
-                    let t0 = Instant::now();
                     tokio::spawn(async move {
                         let net = &app.images.net;
                         let all = async {
@@ -279,22 +250,17 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
                         };
                         if tokio::time::timeout(DIRECT_WAIT, all).await.is_ok() {
                             if let Some(p) = f.pending.lock().remove(&m.req_id) {
-                                f.early_done.fetch_add(1, Ordering::Relaxed);
-                                f.early_wait_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                                 let _ = p.tx.send(Ok(m.outcome));
                             }
-                        } else {
-                            // membership / acks uncertain: the leader's RESPONSE (all acked) completes it
-                            f.early_fallback.fetch_add(1, Ordering::Relaxed);
                         }
+                        // If membership / acks are uncertain, the leader's RESPONSE completes it.
                     });
                 }
                 proto::RESET => {
                     let r: Reset = proto::decode(&payload)?;
                     f.resetting.store(true, Ordering::SeqCst);
-                    let t0 = Instant::now();
                     let mut fresh = super::clone_pristine(app).await;
-                    let (old, lsn, new_epoch) = {
+                    let (old, lsn) = {
                         let mut st = app.state.write();
                         let mut wal = app.wal.inner.lock();
                         app.wal.reset(&mut wal, r.epoch)?;
@@ -302,12 +268,11 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
                         let old = app.swap_state(&mut st, fresh);
                         // a new epoch (initialize) drops uploaded blobs; a same-epoch resync must keep them
                         // (the leader's log still references blobs this node is the origin of)
-                        let new_epoch = app.images.reset_uploads_for_epoch(r.epoch);
-                        (old, wal.lsn, new_epoch)
+                        app.images.reset_uploads_for_epoch(r.epoch);
+                        (old, wal.lsn)
                     };
                     super::drop_in_background(old);
                     f.resetting.store(false, Ordering::SeqCst);
-                    eprintln!("[repl] reset to epoch {:016x} ({}) in {:.1?}", r.epoch, if new_epoch { "new epoch" } else { "resync" }, t0.elapsed());
                     let _ = applied_tx.send((r.epoch, 0, lsn));
                 }
                 proto::RECORDS => {
@@ -323,9 +288,7 @@ async fn session(app: &'static App, stream: TcpStream) -> std::io::Result<()> {
                     if e != a.epoch || s < a.seq {
                         return Err(std::io::Error::other(format!("CAUGHT_UP {}:{} but local is {e}:{s}", a.epoch, a.seq)));
                     }
-                    if !f.caught_up.swap(true, Ordering::SeqCst) {
-                        eprintln!("[repl] caught up with the leader at seq {s}; serving");
-                    }
+                    f.caught_up.store(true, Ordering::SeqCst);
                 }
                 proto::RESPONSE => {
                     let m: ResponseMsg = proto::decode(&payload)?;

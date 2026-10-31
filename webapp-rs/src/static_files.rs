@@ -50,7 +50,6 @@ impl StaticFiles {
             eprintln!("[static] WARN cannot read {}: {e}", dir.display());
         }
         let index = files.get("/index.html").map(|(b, _)| b.clone());
-        eprintln!("[static] {} files from {}", files.len(), dir.display());
         StaticFiles { files, index }
     }
 

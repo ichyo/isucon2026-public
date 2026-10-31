@@ -59,7 +59,8 @@ codegen-units = 1
 # unwind (not abort): a panic in one request / blocking task (e.g. jpeg-decoder on a crafted upload) must not
 # take the whole server down (in-flight requests would see EOF)
 panic = "unwind"
-debug = 1
+debug = 0
+strip = "debuginfo"
 
 [profile.dev.package."*"]
 opt-level = 2

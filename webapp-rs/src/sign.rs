@@ -7,7 +7,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -151,38 +151,15 @@ pub fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     d == 0
 }
 
-/// A cached signature and where it came from (computed here, or pushed by a same-region peer node).
-#[derive(Clone, Copy)]
-struct Entry {
-    sig: [u8; 32],
-    peer: bool,
-}
-
-/// Cache hit/miss counters by path and source (`/metrics` → `signatures`).
-#[derive(Default)]
-pub struct SigStats {
-    pub render_hit_local: AtomicU64,
-    pub render_hit_peer: AtomicU64,
-    pub render_miss: AtomicU64,
-    pub verify_hit_local: AtomicU64,
-    pub verify_hit_peer: AtomicU64,
-    pub verify_miss: AtomicU64,
-    pub computed: AtomicU64,
-    pub peer_received: AtomicU64,
-    pub shared_dropped: AtomicU64,
-    pub precomputed: AtomicU64,
-}
-
 /// Newly computed signatures waiting to be pushed to the same-region peers (sigshare.rs).
 pub const OUTBOX_MAX: usize = 65_536;
 
 pub struct Signer {
-    cache: Mutex<FxHashMap<(Id, i64), Entry>>,
+    cache: Mutex<FxHashMap<(Id, i64), [u8; 32]>>,
     quantum: i64,
     purged_generation: AtomicI64,
     /// Some(..) when same-region sharing is enabled
     outbox: Mutex<Option<Vec<(Id, i64, [u8; 32])>>>,
-    pub stats: SigStats,
     pub changed: tokio::sync::Notify,
 }
 
@@ -193,7 +170,6 @@ impl Signer {
             quantum: quantum.max(1),
             purged_generation: AtomicI64::new(i64::MIN),
             outbox: Mutex::new(None),
-            stats: SigStats::default(),
             changed: tokio::sync::Notify::new(),
         }
     }
@@ -204,43 +180,23 @@ impl Signer {
         e - e.rem_euclid(self.quantum)
     }
 
-    fn hit(&self, e: &Entry, local: &AtomicU64, peer: &AtomicU64) {
-        if e.peer { peer } else { local }.fetch_add(1, Relaxed);
-    }
-
-    /// Cache lookup on the render path (`JsonOut::image_url`).
-    pub fn cached(&self, image: Id, exp: i64) -> Option<[u8; 32]> {
-        let r = self.cache.lock().get(&(image, exp)).copied();
-        match &r {
-            Some(e) => self.hit(e, &self.stats.render_hit_local, &self.stats.render_hit_peer),
-            None => {
-                self.stats.render_miss.fetch_add(1, Relaxed);
-            }
-        }
-        r.map(|e| e.sig)
-    }
-
-    /// Lookup without touching the hit/miss counters.
+    /// Cache lookup without computing a missing signature.
     pub fn peek(&self, image: Id, exp: i64) -> Option<[u8; 32]> {
-        self.cache.lock().get(&(image, exp)).map(|e| e.sig)
+        self.cache.lock().get(&(image, exp)).copied()
     }
 
     /// Inserts a signature computed on this node (and queues it for the same-region peers).
     pub fn insert(&self, image: Id, exp: i64, sig: [u8; 32]) {
-        self.cache.lock().insert((image, exp), Entry { sig, peer: false });
+        self.cache.lock().insert((image, exp), sig);
         self.share(&[(image, exp, sig)]);
         self.changed.notify_waiters();
     }
 
     fn share(&self, items: &[(Id, i64, [u8; 32])]) {
-        self.stats.computed.fetch_add(items.len() as u64, Relaxed);
         let mut ob = self.outbox.lock();
         if let Some(v) = ob.as_mut() {
             let room = OUTBOX_MAX.saturating_sub(v.len());
             v.extend_from_slice(&items[..items.len().min(room)]);
-            if items.len() > room {
-                self.stats.shared_dropped.fetch_add((items.len() - room) as u64, Relaxed);
-            }
         }
     }
 
@@ -257,16 +213,16 @@ impl Signer {
         self.outbox.lock().as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    pub fn outbox_len(&self) -> usize {
+    #[cfg(test)]
+    fn outbox_len(&self) -> usize {
         self.outbox.lock().as_ref().map_or(0, |v| v.len())
     }
 
     /// Signatures pushed by a same-region peer (computed by our own code there): cached, never re-shared.
     pub fn insert_peer(&self, items: &[(Id, i64, [u8; 32])]) {
-        self.stats.peer_received.fetch_add(items.len() as u64, Relaxed);
         let mut c = self.cache.lock();
         for &(img, exp, sig) in items {
-            c.entry((img, exp)).or_insert(Entry { sig, peer: true });
+            c.entry((img, exp)).or_insert(sig);
         }
         drop(c);
         self.changed.notify_waiters();
@@ -274,8 +230,8 @@ impl Signer {
 
     /// Cached signature (computing + caching on miss). Expensive on miss (~0.1–0.5 ms): call off-lock.
     pub fn sign(&self, key: &[u8; 32], image: Id, exp: i64) -> [u8; 32] {
-        if let Some(e) = self.cache.lock().get(&(image, exp)).copied() {
-            return e.sig;
+        if let Some(sig) = self.peek(image, exp) {
+            return sig;
         }
         let s = compute_one(key, image, exp);
         self.insert(image, exp, s);
@@ -285,14 +241,7 @@ impl Signer {
     /// Verification against the cache only: `Some(result)` if (image, exp) is cached, `None` otherwise
     /// (then compute the expected signature off-lock, e.g. `sigbatch::VerifyBatcher`).
     pub fn verify_cached(&self, image: Id, exp: i64, sig: &[u8; 32]) -> Option<bool> {
-        let r = self.cache.lock().get(&(image, exp)).copied();
-        match &r {
-            Some(e) => self.hit(e, &self.stats.verify_hit_local, &self.stats.verify_hit_peer),
-            None => {
-                self.stats.verify_miss.fetch_add(1, Relaxed);
-            }
-        }
-        r.map(|e| ct_eq(&e.sig, sig))
+        self.peek(image, exp).map(|expected| ct_eq(&expected, sig))
     }
 
     /// Full verification (computes + caches on miss — expensive, call off-lock).
@@ -322,7 +271,7 @@ impl Signer {
             let mut first: FxHashMap<Id, usize> = FxHashMap::default();
             for (i, (img, _)) in jobs.iter().enumerate() {
                 match c.get(&(*img, exp)) {
-                    Some(e) => out[i] = e.sig,
+                    Some(sig) => out[i] = *sig,
                     None => match first.entry(*img) {
                         std::collections::hash_map::Entry::Occupied(e) => dups.push((i, *e.get())),
                         std::collections::hash_map::Entry::Vacant(e) => {
@@ -344,7 +293,7 @@ impl Signer {
             let mut c = self.cache.lock();
             for &(i, s) in &computed {
                 out[i] = s;
-                c.insert((jobs[i].0, exp), Entry { sig: s, peer: false });
+                c.insert((jobs[i].0, exp), s);
                 fresh.push((jobs[i].0, exp, s));
             }
         }
@@ -370,10 +319,9 @@ impl Signer {
         {
             let mut c = self.cache.lock();
             for ((id, _), sig) in todo.iter().zip(sigs) {
-                c.entry((*id, exp)).or_insert(Entry { sig, peer: false });
+                c.entry((*id, exp)).or_insert(sig);
             }
         }
-        self.stats.precomputed.fetch_add(todo.len() as u64, Relaxed);
         self.changed.notify_waiters();
     }
 
@@ -394,22 +342,6 @@ impl Signer {
 
     pub fn len(&self) -> usize {
         self.cache.lock().len()
-    }
-
-    pub fn stats_json(&self) -> serde_json::Value {
-        let s = &self.stats;
-        let g = |a: &AtomicU64| a.load(Relaxed);
-        serde_json::json!({
-            "backend": Backend::get().name(),
-            "cache_entries": self.len(),
-            "render": {"hit_local": g(&s.render_hit_local), "hit_peer": g(&s.render_hit_peer), "miss": g(&s.render_miss)},
-            "verify": {"hit_local": g(&s.verify_hit_local), "hit_peer": g(&s.verify_hit_peer), "miss": g(&s.verify_miss)},
-            "computed": g(&s.computed),
-            "precomputed": g(&s.precomputed),
-            "peer_received": g(&s.peer_received),
-            "share_outbox": self.outbox_len(),
-            "share_dropped": g(&s.shared_dropped),
-        })
     }
 }
 
@@ -535,11 +467,11 @@ mod prewarm_tests {
             tampered[0] ^= 1;
             assert_eq!(signer.verify_cached(image, exp, &tampered), Some(false));
         }
-        assert_eq!(signer.stats.precomputed.load(Relaxed), 2);
-        assert_eq!(signer.stats.computed.load(Relaxed), 0);
+        assert_eq!(signer.len(), 2);
         assert_eq!(signer.outbox_len(), 0);
         signer.precompute(&jobs, exp);
-        assert_eq!(signer.stats.precomputed.load(Relaxed), 2, "already warm images are not recomputed");
+        assert_eq!(signer.len(), 2, "warming cached images preserves the existing entries");
+        assert_eq!(signer.outbox_len(), 0);
     }
 
     #[test]

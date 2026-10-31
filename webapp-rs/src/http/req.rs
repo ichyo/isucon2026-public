@@ -1,7 +1,6 @@
 //! Request wrapper and binding rules (§2.5).
 
 use std::borrow::Cow;
-use std::time::Instant;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -24,13 +23,6 @@ pub type BodySlot = std::sync::Arc<parking_lot::Mutex<Option<Incoming>>>;
 /// reserves min(Content-Length, its cap) before reading and waits when the budget is exhausted.
 static BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 static BUDGET_KIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600 * 1024);
-/// bytes currently reserved by buffered bodies / peak / requests that had to wait
-pub static BODY_BYTES_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static BODY_BYTES_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static BODY_BUDGET_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// uploads rejected without buffering (over their cap / not a JPEG prefix)
-pub static BODY_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub fn init_body_budget(mb: u64) {
     let kib = (mb.max(64) * 1024).min(u32::MAX as u64 / 2);
     BUDGET_KIB.store(kib, std::sync::atomic::Ordering::Relaxed);
@@ -45,31 +37,24 @@ pub fn budget_kib() -> u64 {
     BUDGET_KIB.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Unreserved body-buffer budget, read directly from the admission semaphore.
+pub fn budget_available_kib() -> u64 {
+    budget().available_permits() as u64
+}
+
 /// A reservation in the body budget (released on drop, i.e. when the request finishes).
 pub struct BudgetGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    bytes: u64,
-}
-impl Drop for BudgetGuard {
-    fn drop(&mut self) {
-        BODY_BYTES_IN_USE.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 async fn reserve(bytes: u64) -> Option<BudgetGuard> {
-    use std::sync::atomic::Ordering::Relaxed;
     let kib = (bytes.div_ceil(1024)).clamp(1, budget_kib()) as u32;
     let sem = budget().clone();
     let permit = match sem.clone().try_acquire_many_owned(kib) {
         Ok(p) => p,
-        Err(_) => {
-            BODY_BUDGET_WAITS.fetch_add(1, Relaxed);
-            sem.acquire_many_owned(kib).await.ok()?
-        }
+        Err(_) => sem.acquire_many_owned(kib).await.ok()?,
     };
-    let now = BODY_BYTES_IN_USE.fetch_add(bytes, Relaxed) + bytes;
-    BODY_BYTES_PEAK.fetch_max(now, Relaxed);
-    Some(BudgetGuard { _permit: permit, bytes })
+    Some(BudgetGuard { _permit: permit })
 }
 
 // ---- upload gate (FIFO admission of large bodies) ---------------------------------------------------------
@@ -77,13 +62,10 @@ async fn reserve(bytes: u64) -> Option<BudgetGuard> {
 /// At most `slots` bodies > SMALL_DRAIN are received at once, admitted in arrival order (tokio's semaphore is
 /// fair); the others wait unread so their (small, ISUREAL_RCVBUF) receive windows close and the router's
 /// per-region bandwidth goes to the admitted ones: uploads complete one after another instead of all at the end.
-/// 0 = off (ISUREAL_UPLOAD_SLOTS; runtime: POST control /uploadgate?slots=N).
+/// 0 = off (ISUREAL_UPLOAD_SLOTS).
 static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 static GATE_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static GATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-pub static GATE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static GATE_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static GATE_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn gate() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(0)))
@@ -113,21 +95,13 @@ pub fn set_gate_slots(n: usize) {
 }
 
 async fn gate_enter() -> Option<tokio::sync::OwnedSemaphorePermit> {
-    use std::sync::atomic::Ordering::Relaxed;
     if gate_slots() == 0 {
         return None;
     }
-    GATE_PASSES.fetch_add(1, Relaxed);
     let sem = gate().clone();
     match sem.clone().try_acquire_owned() {
         Ok(p) => Some(p),
-        Err(_) => {
-            let t = std::time::Instant::now();
-            GATE_WAITS.fetch_add(1, Relaxed);
-            let p = sem.acquire_owned().await.ok();
-            GATE_WAIT_US.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
-            p
-        }
+        Err(_) => sem.acquire_owned().await.ok(),
     }
 }
 
@@ -196,7 +170,6 @@ pub struct Req {
     pub(crate) body_bytes: Option<Bytes>,
     /// client IP (X-Client-IP verbatim, fallback TCP peer)
     pub ip: String,
-    pub start: Instant,
     /// body-budget reservation held until the request finishes
     pub(crate) budget: Option<BudgetGuard>,
 }
@@ -282,7 +255,6 @@ impl Req {
         if declared.is_some_and(|n| n > cap as u64) {
             // decided from the header: nothing is received (the HTTP layer answers with Connection: close)
             *self.body.lock() = Some(body);
-            BODY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Capped::Rejected);
         }
         let want = declared.map_or(cap as u64, |n| n.min(cap as u64));
@@ -326,9 +298,7 @@ impl Req {
                 rejected = true;
             }
         }
-        crate::metrics::set_body_recv(self.start.elapsed());
         if rejected {
-            BODY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Capped::Rejected);
         }
         let b = buf.freeze();

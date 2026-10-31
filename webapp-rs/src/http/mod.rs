@@ -6,7 +6,6 @@ pub mod router;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 use http::{HeaderValue, Method, Request, Response};
 use hyper::body::Incoming;
@@ -18,9 +17,7 @@ pub use resp::{Abuse, ApiError, HBody, HResult, Resp, RespBody};
 use router::Match;
 
 use crate::app::App;
-use crate::metrics;
 use crate::model::now_us;
-use crate::throttle;
 
 pub async fn serve(app: &'static App, listener: TcpListener) {
     loop {
@@ -81,27 +78,11 @@ fn client_ip(req: &Request<Incoming>, peer: SocketAddr) -> String {
 }
 
 async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> Result<Response<HBody>, Infallible> {
-    let start = Instant::now();
     let ip = client_ip(&req, peer);
     let (parts, body) = req.into_parts();
     let body: req::BodySlot = std::sync::Arc::new(parking_lot::Mutex::new(Some(body)));
     let path = parts.uri.path().to_string();
-    let kind = throttle::kind_of(&path);
-    let mut action = "-";
-    let mut action_id = metrics::A_NOT_FOUND;
-    let mut repl = (0u64, 0u64);
     let req_bytes = content_length(&parts.headers);
-    let alog_headers: Option<(String, String)> = crate::accesslog::enabled().then(|| {
-        let v = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("-");
-        let ua = parts.headers.get(http::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
-        let cc = parts.headers.get("x-country-code").and_then(|v| v.to_str().ok()).unwrap_or("-");
-        let ua: String = ua.chars().take(60).map(|c| if c == '\t' { ' ' } else { c }).collect();
-        (
-            format!("{}\t{}\t{}", &v[v.len().saturating_sub(8)..], cc, ua),
-            crate::accesslog::header_value(&parts.headers, http::header::ACCEPT_ENCODING),
-        )
-    });
-    let mut alog_body_us: i64 = -1;
 
     let too_large = parts
         .headers
@@ -112,24 +93,19 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
 
     let mut resp: Resp = if parts.headers.contains_key(HEALTH_HEADER) && path == "/" {
         // load-balancer health check (HAProxy on asia1): 200 only while this node may serve reads
-        action_id = metrics::A_HEALTH;
         if follower_in_sync_now(app) {
             Resp::bytes(200, "text/plain", "ok\n")
         } else {
             Resp::bytes(503, "text/plain", "not in sync\n")
         }
     } else if too_large {
-        action_id = metrics::A_TOO_LARGE;
         ApiError::new(413, "Request Entity Too Large").into_resp()
     } else if app.bans.is_banned(&ip, now_us()) {
-        action_id = metrics::A_BANNED;
         ApiError::forbidden("ip_banned").into_resp()
     } else if path.starts_with("/api/") && !follower_in_sync(app).await {
         // never answer from a replica that is known to be behind (link down / catching up / resetting)
-        action_id = metrics::A_NOT_IN_SYNC;
         ApiError::unavailable("replica not in sync").into_resp()
     } else if !path.starts_with("/api/") {
-        action_id = metrics::A_STATIC;
         if parts.method == Method::GET || parts.method == Method::HEAD {
             match app.statics.get(&path) {
                 Some((b, ct)) => Resp::bytes(200, ct, b),
@@ -142,16 +118,12 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         match app.router.find(&parts.method, &path) {
             Match::NotFound => ApiError::not_found("Not Found").into_resp(),
             Match::MethodNotAllowed(allow) => {
-                action_id = metrics::A_METHOD_NOT_ALLOWED;
                 ApiError::new(405, "Method Not Allowed").into_resp().header("allow", &allow)
             }
             Match::Options(allow) => {
-                action_id = metrics::A_OPTIONS;
                 Resp::no_content().header("allow", &allow)
             }
             Match::Found(route, params) => {
-                action = route.name;
-                action_id = metrics::Metrics::route_action(route.idx);
                 let r = Req {
                     method: parts.method.clone(),
                     path: path.clone(),
@@ -161,21 +133,9 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     body: body.clone(),
                     body_bytes: None,
                     ip: ip.clone(),
-                    start,
                     budget: None,
                 };
-                let (result, rw, ph) = metrics::REPL_WAIT
-                    .scope(
-                        std::cell::Cell::new((0, 0)),
-                        metrics::PHASES.scope(std::cell::Cell::new(metrics::Phases::default()), async move {
-                            let res = (route.handler)(app, r).await;
-                            (res, metrics::REPL_WAIT.with(|c| c.get()), metrics::PHASES.with(|c| c.get()))
-                        }),
-                    )
-                    .await;
-                repl = rw;
-                alog_body_us = ph.body_recv_us.map_or(-1, |v| v as i64);
-                app.metrics.record_phases(action_id, ph);
+                let result = (route.handler)(app, r).await;
                 match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -198,56 +158,13 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     // bandwidth): the response carries `Connection: close` (the router does not reuse the connection) and the
     // connection ends with a lingering close (FIN after the response, then unread data is discarded for ≤ 2 s
     // before the socket is closed — never an RST before the response is delivered).
-    let drained = if req::body_pending(&body) {
+    if req::body_pending(&body) {
         if req_bytes > 0 && req_bytes <= req::SMALL_DRAIN as u64 {
-            req::drain(&body).await
+            req::drain(&body).await;
         } else {
             body.lock().take();
             resp = resp.header("connection", "close");
-            req::Drain::Failed
         }
-    } else {
-        req::Drain::None
-    };
-    app.metrics.record_drain(action_id, drained);
-    let resp_bytes = match &resp.body {
-        RespBody::Full(b) => b.len() as u64,
-        _ => 0,
-    };
-    app.metrics.record(action_id, resp.status, start.elapsed(), repl, req_bytes, resp_bytes);
-    if let Some((tok, accept_encoding)) = &alog_headers {
-        let dur = start.elapsed().as_micros() as u64;
-        let ctype = resp.ctype.map(HeaderValue::from_static);
-        let content_type = crate::accesslog::header_values(
-            ctype.iter().chain(resp.headers.iter().filter_map(|(name, value)| (name == http::header::CONTENT_TYPE).then_some(value))),
-        );
-        let content_encoding = crate::accesslog::header_values(
-            resp.headers.iter().filter_map(|(name, value)| (name == http::header::CONTENT_ENCODING).then_some(value)),
-        );
-        crate::accesslog::write(format_args!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            now_us() - dur as i64,
-            dur,
-            alog_body_us,
-            repl.0,
-            resp.status,
-            parts.method,
-            action,
-            ip,
-            tok,
-            req_bytes,
-            resp_bytes,
-            path,
-            accept_encoding,
-            content_type,
-            content_encoding
-        ));
-    }
-    if let Some(d) = app.throttle.delay(kind) {
-        tokio::time::sleep(d).await;
-    }
-    if app.cfg.log_debug {
-        eprintln!("[req] {} {} {} action={} ip={} {:.1?}", parts.method, path, resp.status, action, ip, start.elapsed());
     }
     Ok(to_hyper(resp))
 }

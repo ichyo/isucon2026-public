@@ -1,13 +1,11 @@
 //! ISUReal — in-memory, multi-region replicated re-implementation. See docs/design.md.
 
-pub mod accesslog;
 pub mod api;
 pub mod app;
 pub mod apply;
 pub mod bans;
 pub mod blobs;
 pub mod command;
-pub mod compressionlog;
 pub mod config;
 pub mod entry;
 pub mod http;
@@ -15,7 +13,6 @@ pub mod images;
 pub mod jpeg;
 pub mod json;
 pub mod loader;
-pub mod metrics;
 pub mod model;
 pub mod repl;
 pub mod rt;
@@ -34,7 +31,7 @@ pub mod sse;
 pub mod state;
 pub mod static_files;
 pub mod text;
-pub mod throttle;
+pub mod control;
 pub mod timefmt;
 pub mod views;
 pub mod wal;

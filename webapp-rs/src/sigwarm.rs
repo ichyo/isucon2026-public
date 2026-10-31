@@ -2,7 +2,7 @@
 //! precede RealMojis; newly applied images interrupt bulk work and overlap replication ACKs.
 //! Cache entries are only expected signatures: image existence, liveness and expiry checks stay intact.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -44,13 +44,6 @@ pub struct Warmer {
     core_exp: AtomicI64,
     complete_exp: AtomicI64,
     target_exp: AtomicI64,
-    scanned: AtomicU64,
-    total: AtomicU64,
-    elapsed_ms: AtomicU64,
-    new_images: AtomicU64,
-    new_batches: AtomicU64,
-    new_compute_us: AtomicU64,
-    dropped: AtomicU64,
     changed: tokio::sync::Notify,
 }
 
@@ -64,13 +57,6 @@ impl Default for Warmer {
             core_exp: AtomicI64::new(0),
             complete_exp: AtomicI64::new(0),
             target_exp: AtomicI64::new(0),
-            scanned: AtomicU64::new(0),
-            total: AtomicU64::new(0),
-            elapsed_ms: AtomicU64::new(0),
-            new_images: AtomicU64::new(0),
-            new_batches: AtomicU64::new(0),
-            new_compute_us: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
         }
     }
@@ -123,23 +109,20 @@ impl Warmer {
 
     /// Called under the replication state lock: only a nonblocking bounded enqueue.
     pub fn image_created(&self, image: Id, key: [u8; 32]) {
-        if self.enabled && self.tx.try_send((image, key)).is_err() {
-            self.dropped.fetch_add(1, Relaxed); // normal request-path signing is always available
+        if self.enabled {
+            // Normal request-path signing remains available if the bounded queue is full.
+            let _ = self.tx.try_send((image, key));
         }
     }
 
     fn fresh_many(&self, app: &App, jobs: &[Job]) {
         if jobs.is_empty() { return; }
-        let started = Instant::now();
         let exp = app.signer.exp_for(now_us() / 1_000_000);
         app.signer.sign_many_serial(jobs, exp);
         let next = self.target_exp.load(Relaxed);
         if next > exp {
             app.signer.precompute(jobs, next);
         }
-        self.new_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        self.new_images.fetch_add(jobs.len() as u64, Relaxed);
-        self.new_batches.fetch_add(1, Relaxed);
     }
 
     fn run(&self, app: &'static App, rx: Receiver<Job>) {
@@ -152,16 +135,13 @@ impl Warmer {
                 let target = if self.complete_exp.load(Relaxed) < current { current } else { app.signer.exp_for(now + lead) };
                 if target > self.complete_exp.load(Relaxed) {
                     self.target_exp.store(target, Relaxed);
-                    let started = Instant::now();
                     let (mut work, core) = jobs(&app.pristine, None);
                     let (extra, _) = {
                         let st = app.read();
                         jobs(&st, Some(&app.pristine))
                     };
                     work.extend(extra);
-                    self.total.store(work.len() as u64, Relaxed);
-                    self.scanned.store(0, Relaxed);
-                    eprintln!("[sigwarm] start exp={target} core={core} total={}", work.len());
+                    let mut scanned = 0;
                     if core == 0 {
                         self.core_exp.store(target, Relaxed);
                         self.changed.notify_waiters();
@@ -175,17 +155,14 @@ impl Warmer {
                         let fresh: Vec<_> = rx.try_iter().take(FRESH_BATCH).collect();
                         self.fresh_many(app, &fresh);
                         app.signer.precompute(chunk, target);
-                        let n = self.scanned.fetch_add(chunk.len() as u64, Relaxed) + chunk.len() as u64;
-                        if n >= core as u64 && self.core_exp.load(Relaxed) < target {
+                        scanned += chunk.len();
+                        if scanned >= core && self.core_exp.load(Relaxed) < target {
                             self.core_exp.store(target, Relaxed);
                             self.changed.notify_waiters();
-                            eprintln!("[sigwarm] core ready exp={target} in {:.1?}", started.elapsed());
                         }
                     }
-                    self.elapsed_ms.store(started.elapsed().as_millis() as u64, Relaxed);
                     self.complete_exp.store(target, Relaxed);
                     self.changed.notify_waiters();
-                    eprintln!("[sigwarm] complete exp={target} images={} in {:.1?}", work.len(), started.elapsed());
                     continue;
                 }
             }
@@ -215,22 +192,7 @@ impl Warmer {
                 ready.await;
             }
         };
-        if tokio::time::timeout(Duration::from_secs(45), wait).await.is_err() {
-            eprintln!("[sigwarm] initialize warmup budget reached; remaining images continue in background");
-        }
-    }
-
-    pub fn stats_json(&self) -> serde_json::Value {
-        let new_images = self.new_images.load(Relaxed);
-        let new_batches = self.new_batches.load(Relaxed);
-        serde_json::json!({"enabled": self.enabled, "target_exp": self.target_exp.load(Relaxed),
-            "core_exp": self.core_exp.load(Relaxed), "complete_exp": self.complete_exp.load(Relaxed),
-            "scanned": self.scanned.load(Relaxed), "total": self.total.load(Relaxed),
-            "elapsed_ms": self.elapsed_ms.load(Relaxed), "new_images": new_images,
-            "new_batches": new_batches,
-            "new_batch_avg_images": if new_batches == 0 { 0.0 } else { new_images as f64 / new_batches as f64 },
-            "new_compute_ms": self.new_compute_us.load(Relaxed) as f64 / 1000.0,
-            "dropped": self.dropped.load(Relaxed)})
+        let _ = tokio::time::timeout(Duration::from_secs(45), wait).await;
     }
 }
 

@@ -38,10 +38,7 @@ enum Deny {
 // GET /api/images/{imageId}?exp=…&sig=… — no auth, not pinned.
 pub async fn get_image(ctx: Ctx, req: Req) -> HResult {
     Ok(match serve(ctx, req.param(0), req.raw_query()).await {
-        Ok(bytes) => {
-            crate::compressionlog::image(&req, &bytes);
-            no_store(Resp::bytes(200, "image/jpeg", bytes))
-        }
+        Ok(bytes) => no_store(Resp::bytes(200, "image/jpeg", bytes)),
         Err(Deny::Forbidden) => forbidden(),
         Err(Deny::BadSignature) => {
             ctx.on_abuse(&req.ip, Abuse::InvalidSignature);

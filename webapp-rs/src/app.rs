@@ -19,7 +19,6 @@ use crate::sign::Signer;
 use crate::sse::SseHub;
 use crate::state::State;
 use crate::static_files::StaticFiles;
-use crate::throttle::Throttle;
 use crate::wal::Wal;
 
 pub type Ctx = &'static App;
@@ -34,11 +33,9 @@ pub struct App {
     pub signer: Signer,
     pub sse: SseHub,
     pub bans: Bans,
-    pub throttle: Throttle,
     pub router: Router,
     pub statics: StaticFiles,
     pub repl: Repl,
-    pub metrics: crate::metrics::Metrics,
     /// batches concurrent image-signature verification misses into SIMD passes
     pub sigbatch: crate::sigshare::VerifyBatcher,
     pub sigwarm: crate::sigwarm::Warmer,
@@ -193,9 +190,7 @@ impl App {
                 }
             }
         }
-        // replication wait for the request metrics: leader = submit → all acked, follower = forward round trip
-        let t = std::time::Instant::now();
-        let r = match &self.repl {
+        match &self.repl {
             // exec + replication + ack waits run on the high-priority replication runtime
             Repl::Leader(_) => crate::rt::spawn(async move {
                 let Repl::Leader(l) = &self.repl else { unreachable!() };
@@ -204,9 +199,7 @@ impl App {
             .await
             .unwrap_or_else(|e| Err(ApiError::internal(format!("submit task: {e}")))),
             Repl::Follower(f) => f.forward(cmd).await,
-        };
-        crate::metrics::add_repl_wait(t.elapsed());
-        r
+        }
     }
 
     /// Effects of applied entries; called with the write lock held (`st` = the new state).
@@ -231,7 +224,7 @@ impl App {
             Repl::Leader(_) => self.count_abuse_globally(ip, a),
             Repl::Follower(f) => {
                 if let Some(until) = self.bans.record(ip, a, now_us()) {
-                    self.ban(ip, until, a);
+                    self.ban(ip, until);
                 }
                 let cmd = Command::AbuseReport { ip: ip.to_string(), abuse: a };
                 tokio::spawn(async move {
@@ -244,12 +237,11 @@ impl App {
     /// Leader: one abuse event of any node.
     pub fn count_abuse_globally(&'static self, ip: &str, a: Abuse) {
         if let Some(until) = self.bans.record(ip, a, now_us()) {
-            self.ban(ip, until, a);
+            self.ban(ip, until);
         }
     }
 
-    fn ban(&'static self, ip: &str, until: Ts, a: Abuse) {
-        eprintln!("[ban] {ip} banned until {} ({a:?}) by {}", crate::timefmt::format_ts(until), self.cfg.node.name());
+    fn ban(&'static self, ip: &str, until: Ts) {
         self.bans.set(ip, until);
         let ip = ip.to_string();
         tokio::spawn(async move {
@@ -275,9 +267,8 @@ impl App {
             (w.epoch, w.last_seq, w.end)
         };
         let summary = self.read().summary();
-        let (ms, fms) = self.throttle.get();
         format!(
-            "{{\"node\":\"{}\",\"region\":\"{}\",\"leader_node\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"blobs\":{},\"state\":\"{}\",\"throttle_ms\":{},\"throttle_feed_ms\":{},\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
+            "{{\"node\":\"{}\",\"region\":\"{}\",\"leader_node\":\"{}\",\"role\":\"{}\",\"epoch\":{},\"seq\":{},\"wal_bytes\":{},\"repl\":{},\"blobs\":{},\"state\":\"{}\",\"bans\":{},\"sse_subscribers\":{},\"sig_cache\":{}}}",
             self.cfg.node.name(),
             self.cfg.region.as_str(),
             self.cfg.leader_node.name(),
@@ -288,8 +279,6 @@ impl App {
             self.repl.status_json(),
             self.images.net.status_json(&self.images.blobs, &self.images.cache),
             summary,
-            ms,
-            fms,
             self.bans.active(now_us()),
             self.sse.len(),
             self.signer.len()

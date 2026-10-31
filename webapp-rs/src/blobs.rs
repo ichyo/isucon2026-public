@@ -14,7 +14,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
@@ -57,8 +57,6 @@ pub struct BlobStore {
     fsync: bool,
     written: Arc<(Mutex<u64>, Condvar)>,
     synced: watch::Sender<u64>,
-    pub puts: AtomicU64,
-    pub put_bytes: AtomicU64,
 }
 
 impl BlobStore {
@@ -80,8 +78,6 @@ impl BlobStore {
             fsync,
             written: Arc::new((Mutex::new(0), Condvar::new())),
             synced,
-            puts: AtomicU64::new(0),
-            put_bytes: AtomicU64::new(0),
         };
         if fsync {
             let file = s.file.clone();
@@ -152,8 +148,6 @@ impl BlobStore {
             let mut rx = self.synced.subscribe();
             let _ = rx.wait_for(|&v| v >= lsn).await;
         }
-        self.puts.fetch_add(1, Ordering::Relaxed);
-        self.put_bytes.fetch_add(len as u64, Ordering::Relaxed);
         Ok(BlobRef { origin, key, off: off + HDR, len })
     }
 
@@ -306,33 +300,16 @@ struct ClientConn {
     dead: AtomicBool,
 }
 
-#[derive(Default)]
-pub struct NetStats {
-    pub fetches: AtomicU64,
-    pub fetch_bytes: AtomicU64,
-    pub fetch_errors: AtomicU64,
-    pub fetch_us_total: AtomicU64,
-    pub fetch_us_max: AtomicU64,
-    pub singleflight_joins: AtomicU64,
-    /// requests that gave up waiting (answered 503) while the transfer continued
-    pub wait_timeouts: AtomicU64,
-    pub served: AtomicU64,
-    pub served_bytes: AtomicU64,
-    pub serve_errors: AtomicU64,
-}
-
 pub struct BlobNet {
     peers: Mutex<[Option<String>; NodeId::COUNT]>,
     conns: [tokio::sync::Mutex<Option<Arc<ClientConn>>>; NodeId::COUNT],
     inflight: Mutex<FxHashMap<Id, Vec<oneshot::Sender<FetchResult>>>>,
     next_req: AtomicU64,
-    pub stats: NetStats,
     /// latest (epoch, seq) applied + persisted by each node, as broadcast by that node (ACK_MODE=direct;
     /// the leader's comes over the replication link as LEADER_SYNCED)
     pub peer_acks: [watch::Sender<(u64, u64)>; NodeId::COUNT],
     /// this node's own cumulative ack, pushed to the per-peer broadcast tasks
     pub my_ack: watch::Sender<(u64, u64)>,
-    pub ack_bcasts_received: AtomicU64,
 }
 
 impl BlobNet {
@@ -342,10 +319,8 @@ impl BlobNet {
             conns: Default::default(),
             inflight: Mutex::new(FxHashMap::default()),
             next_req: AtomicU64::new(1),
-            stats: NetStats::default(),
             peer_acks: std::array::from_fn(|_| watch::channel((0, 0)).0),
             my_ack: watch::channel((0, 0)).0,
-            ack_bcasts_received: AtomicU64::new(0),
         }
     }
 
@@ -515,25 +490,18 @@ impl BlobNet {
         };
         if start {
             tokio::spawn(async move {
-                let t0 = Instant::now();
                 let mut res = self.fetch_once(origin, key, off, len, BACKGROUND_FETCH_TIMEOUT).await;
                 if res.is_err() {
                     // one retry on a fresh connection (the previous one may have just died)
                     res = self.fetch_once(origin, key, off, len, BACKGROUND_FETCH_TIMEOUT).await;
                 }
-                let us = t0.elapsed().as_micros() as u64;
                 match &res {
                     Ok(b) => {
-                        self.stats.fetches.fetch_add(1, Ordering::Relaxed);
-                        self.stats.fetch_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                        self.stats.fetch_us_total.fetch_add(us, Ordering::Relaxed);
-                        self.stats.fetch_us_max.fetch_max(us, Ordering::Relaxed);
                         let data = b.clone();
                         // cached before the in-flight entry is removed: later requests hit the cache
                         let _ = tokio::task::spawn_blocking(move || cache.insert(id, &data)).await;
                     }
                     Err(e) => {
-                        self.stats.fetch_errors.fetch_add(1, Ordering::Relaxed);
                         eprintln!("[blobs] fetch of {id} from {} failed: {e}", origin.name());
                     }
                 }
@@ -542,42 +510,22 @@ impl BlobNet {
                     let _ = w.send(res.clone());
                 }
             });
-        } else {
-            self.stats.singleflight_joins.fetch_add(1, Ordering::Relaxed);
         }
         match tokio::time::timeout(FETCH_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err("fetch abandoned".into()),
-            Err(_) => {
-                self.stats.wait_timeouts.fetch_add(1, Ordering::Relaxed);
-                Err(format!("fetch from {} still in progress after {:?}", origin.name(), FETCH_TIMEOUT))
-            }
+            Err(_) => Err(format!("fetch from {} still in progress after {:?}", origin.name(), FETCH_TIMEOUT)),
         }
     }
 
     pub fn status_json(&self, store: &BlobStore, cache: &BlobCache) -> String {
-        let s = &self.stats;
-        let n = s.fetches.load(Ordering::Relaxed);
-        let avg_ms = if n == 0 { 0.0 } else { s.fetch_us_total.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0 };
-        let (cn, cb) = cache.stats();
+        let (entries, bytes) = cache.stats();
         format!(
-            "{{\"store_puts\":{},\"store_put_bytes\":{},\"store_file_bytes\":{},\"fetches\":{},\"fetch_bytes\":{},\"fetch_errors\":{},\"fetch_avg_ms\":{:.1},\"fetch_max_ms\":{:.1},\"singleflight_joins\":{},\"wait_timeouts\":{},\"inflight\":{},\"cache_entries\":{},\"cache_bytes\":{},\"served\":{},\"served_bytes\":{},\"serve_errors\":{}}}",
-            store.puts.load(Ordering::Relaxed),
-            store.put_bytes.load(Ordering::Relaxed),
+            "{{\"store_file_bytes\":{},\"inflight\":{},\"cache_entries\":{},\"cache_bytes\":{}}}",
             store.size(),
-            n,
-            s.fetch_bytes.load(Ordering::Relaxed),
-            s.fetch_errors.load(Ordering::Relaxed),
-            avg_ms,
-            s.fetch_us_max.load(Ordering::Relaxed) as f64 / 1000.0,
-            s.singleflight_joins.load(Ordering::Relaxed),
-            s.wait_timeouts.load(Ordering::Relaxed),
             self.inflight.lock().len(),
-            cn,
-            cb,
-            s.served.load(Ordering::Relaxed),
-            s.served_bytes.load(Ordering::Relaxed),
-            s.serve_errors.load(Ordering::Relaxed),
+            entries,
+            bytes,
         )
     }
 }
@@ -610,7 +558,6 @@ pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, signer: &'s
                     if let Some(n) = NodeId::from_u8(p[0]) {
                         let epoch = u64::from_le_bytes(p[1..9].try_into().unwrap());
                         let seq = u64::from_le_bytes(p[9..17].try_into().unwrap());
-                        net.ack_bcasts_received.fetch_add(1, Ordering::Relaxed);
                         net.peer_acks[n.idx()].send_if_modified(|v| {
                             let newer = (epoch, seq) != *v;
                             *v = (epoch, seq);
@@ -635,15 +582,12 @@ pub async fn serve(store: &'static BlobStore, net: &'static BlobNet, signer: &'s
                     let mut out = Vec::with_capacity(13 + len as usize);
                     match r {
                         Ok(b) => {
-                            net.stats.served.fetch_add(1, Ordering::Relaxed);
-                            net.stats.served_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
                             out.extend_from_slice(&((9 + b.len()) as u32).to_le_bytes());
                             out.push(RESP_OK);
                             out.extend_from_slice(&req.to_le_bytes());
                             out.extend_from_slice(&b);
                         }
                         Err(e) => {
-                            net.stats.serve_errors.fetch_add(1, Ordering::Relaxed);
                             let msg = e.to_string();
                             out.extend_from_slice(&((9 + msg.len()) as u32).to_le_bytes());
                             out.push(RESP_ERR);

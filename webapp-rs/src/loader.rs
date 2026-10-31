@@ -3,7 +3,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use csv::ByteRecord;
@@ -358,7 +357,6 @@ fn cmp_ts_id<'a, T>(v: &'a [T], key: impl Fn(&T) -> (Ts, Id) + 'a) -> impl Fn(&u
 
 /// Loads the initial dataset from `dir`.
 pub fn load(dir: &Path) -> Result<State> {
-    let t0 = Instant::now();
     let res = std::thread::scope(|s| -> Result<_> {
         let h_rm = s.spawn(|| load_realmojis(dir));
         let h_cm = s.spawn(|| load_comments(dir));
@@ -382,7 +380,6 @@ pub fn load(dir: &Path) -> Result<State> {
         Ok((small, posts, rms, cms, idx))
     })?;
     let ((mut users_raw, admins, mut windows, mut frs, fships, follows, blocks), mut posts_raw, mut rms_raw, mut cms_raw, idx) = res;
-    let t_parse = t0.elapsed();
 
     let mut st = State::default();
 
@@ -584,7 +581,6 @@ pub fn load(dir: &Path) -> Result<State> {
     });
     st.users_sorted = us;
 
-    eprintln!("[loader] loaded {} (parse {:.2?}, total {:.2?})", st.summary(), t_parse, t0.elapsed());
     Ok(st)
 }
 

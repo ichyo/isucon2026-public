@@ -12,8 +12,6 @@
 //! ```
 
 use std::io::Write as _;
-use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
 
 use crate::model::{Date, Id, Ts};
 use crate::sign::{self, Signer, SIG_LEN};
@@ -163,7 +161,7 @@ impl JsonOut {
         self.buf.extend_from_slice(b"\"/api/images/");
         image.write_to(&mut self.buf);
         let _ = write!(self.buf, "?exp={}&sig=", self.exp);
-        match self.signer.cached(image, self.exp) {
+        match self.signer.peek(image, self.exp) {
             Some(sig) => self.buf.extend_from_slice(&sign::encode_sig(&sig)),
             None => {
                 let pos = self.buf.len();
@@ -202,7 +200,6 @@ impl JsonOut {
                 break;
             }
             let permits = if self.pending.len() <= 8 { crate::rt::small_sign_permits() } else { crate::rt::sign_permits() };
-            let queued = Instant::now();
             let acquire = permits.acquire();
             tokio::pin!(acquire);
             let permit = loop {
@@ -212,15 +209,13 @@ impl JsonOut {
                 changed.as_mut().enable();
                 self.resolve_cached();
                 if self.pending.is_empty() {
-                    crate::sigshare::STATS.render_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
                     return Ok(self.finish());
                 }
                 tokio::select! {
                     p = &mut acquire => break p.expect("signature semaphore is never closed"),
-                    _ = &mut changed => { crate::sigshare::STATS.cache_wakeups.fetch_add(1, Relaxed); }
+                    _ = &mut changed => {}
                 }
             };
-            crate::sigshare::STATS.render_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
             // One SIMD pass at most, regardless of the number of URLs in a response. In particular,
             // history responses no longer retain a semaphore permit for all their images.
             let mut jobs = Vec::with_capacity(16);
@@ -237,10 +232,7 @@ impl JsonOut {
             tokio::task::spawn_blocking(move || {
                 // Keep the permit with the actual CPU work, including when the client task is cancelled.
                 let _permit = permit;
-                let started = Instant::now();
                 signer.sign_many_serial(&jobs, exp);
-                crate::sigshare::STATS.render_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-                crate::sigshare::STATS.render_batches.fetch_add(1, Relaxed);
             })
             .await?;
         }
@@ -341,6 +333,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_json_finishes_on_peer_cache_without_a_permit() {
         let signer: &'static Signer = Box::leak(Box::new(Signer::new(1)));
+        signer.enable_sharing();
         let image = Id::new_v4();
         let key = [19; 32];
         let exp = 1_900_000_000;
@@ -355,7 +348,7 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), request).await.unwrap().unwrap().unwrap();
         let expected = format!("\"/api/images/{image}?exp={exp}&sig={}\"\n", std::str::from_utf8(&sign::encode_sig(&sig)).unwrap());
         assert_eq!(result, expected.into_bytes());
-        assert_eq!(signer.stats.computed.load(Relaxed), 0);
+        assert!(signer.take_outbox().is_empty(), "peer cache completion must not compute and share a new signature");
     }
 
     #[tokio::test]
@@ -377,7 +370,7 @@ mod tests {
         for (image, key) in jobs {
             assert_eq!(signer.peek(image, 12345), Some(sign::compute(&key, image, 12345)));
         }
-        assert_eq!(signer.stats.computed.load(Relaxed), 37);
+        assert_eq!(signer.len(), 37);
     }
 
     fn f(v: f64) -> String {

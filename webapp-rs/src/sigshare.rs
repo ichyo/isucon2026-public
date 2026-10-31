@@ -9,8 +9,7 @@
 //! * `VerifyBatcher`: concurrent verification misses (image GETs of URLs nobody here computed) are collected for
 //!   ≤ 1 ms / up to one SIMD pass (`Backend::lanes()`) and computed together, deduplicated per (image, exp).
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -24,24 +23,6 @@ const FLUSH_EVERY: Duration = Duration::from_millis(5);
 const BATCH: usize = 512;
 const ENTRY: usize = 16 + 8 + 32;
 const COLLECT: Duration = Duration::from_millis(1);
-
-#[derive(Default)]
-pub struct ShareStats {
-    pub frames_sent: AtomicU64,
-    pub entries_sent: AtomicU64,
-    pub entries_dropped: AtomicU64,
-    pub batches: AtomicU64,
-    pub batch_jobs: AtomicU64,
-    pub batch_computed: AtomicU64,
-    pub render_batches: AtomicU64,
-    pub render_queue_us: AtomicU64,
-    pub render_compute_us: AtomicU64,
-    pub verify_queue_us: AtomicU64,
-    pub verify_compute_us: AtomicU64,
-    pub cache_wakeups: AtomicU64,
-}
-
-pub static STATS: std::sync::LazyLock<ShareStats> = std::sync::LazyLock::new(ShareStats::default);
 
 pub fn encode(items: &[(Id, i64, [u8; 32])]) -> Vec<u8> {
     let mut p = Vec::with_capacity(2 + items.len() * ENTRY);
@@ -77,7 +58,6 @@ pub fn spawn_sharing(app: &'static crate::app::App) {
     if peers.is_empty() {
         return;
     }
-    eprintln!("[sigshare] sharing computed signatures with {:?}", peers.iter().map(|n| n.name()).collect::<Vec<_>>());
     app.signer.enable_sharing();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(FLUSH_EVERY);
@@ -91,11 +71,8 @@ pub fn spawn_sharing(app: &'static crate::app::App) {
             for chunk in items.chunks(BATCH) {
                 let payload = encode(chunk);
                 for &p in &peers {
-                    if app.images.net.has_peer(p) && app.images.net.send_frame(p, SIG_SHARE, &payload).await {
-                        STATS.frames_sent.fetch_add(1, Relaxed);
-                        STATS.entries_sent.fetch_add(chunk.len() as u64, Relaxed);
-                    } else {
-                        STATS.entries_dropped.fetch_add(chunk.len() as u64, Relaxed);
+                    if app.images.net.has_peer(p) {
+                        let _ = app.images.net.send_frame(p, SIG_SHARE, &payload).await;
                     }
                 }
             }
@@ -161,12 +138,11 @@ impl VerifyBatcher {
                             }
                             break;
                         }
-                        _ = &mut changed => { STATS.cache_wakeups.fetch_add(1, Relaxed); }
+                        _ = &mut changed => {}
                     }
                 }
             }
         }
-        let queued = Instant::now();
         let acquire = crate::rt::small_sign_permits().acquire();
         tokio::pin!(acquire);
         let permit = loop {
@@ -174,21 +150,16 @@ impl VerifyBatcher {
             tokio::pin!(changed);
             changed.as_mut().enable();
             if let Some(sig) = signer.peek(image, exp) {
-                STATS.verify_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
                 return sig;
             }
             tokio::select! {
                 p = &mut acquire => break p.expect("signature semaphore is never closed"),
-                _ = &mut changed => { STATS.cache_wakeups.fetch_add(1, Relaxed); }
+                _ = &mut changed => {}
             }
         };
-        STATS.verify_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let started = Instant::now();
-            let sig = signer.sign(&key, image, exp);
-            STATS.verify_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-            sig
+            signer.sign(&key, image, exp)
         })
         .await
         .unwrap_or_else(|_| sign::compute(&key, image, exp))
@@ -211,9 +182,6 @@ async fn collect(mut rx: mpsc::UnboundedReceiver<Job>, signer: &'static Signer, 
 }
 
 async fn run_batch(mut jobs: Vec<Job>, signer: &'static Signer, backend: Backend) {
-    STATS.batches.fetch_add(1, Relaxed);
-    STATS.batch_jobs.fetch_add(jobs.len() as u64, Relaxed);
-    let queued = Instant::now();
     let acquire = crate::rt::small_sign_permits().acquire();
     tokio::pin!(acquire);
     let permit = loop {
@@ -235,15 +203,13 @@ async fn run_batch(mut jobs: Vec<Job>, signer: &'static Signer, backend: Backend
         }
         jobs = pending;
         if jobs.is_empty() {
-            STATS.verify_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
             return;
         }
         tokio::select! {
             p = &mut acquire => break p.expect("signature semaphore is never closed"),
-            _ = &mut changed => { STATS.cache_wakeups.fetch_add(1, Relaxed); }
+            _ = &mut changed => {}
         }
     };
-    STATS.verify_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
     // dedupe per (image, exp), group per exp (one SIMD pass computes one exp)
     let mut groups: FxHashMap<i64, Vec<(Id, [u8; 32])>> = FxHashMap::default();
     let mut seen: FxHashMap<(Id, i64), ()> = FxHashMap::default();
@@ -254,7 +220,6 @@ async fn run_batch(mut jobs: Vec<Job>, signer: &'static Signer, backend: Backend
     }
     let results = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let started = Instant::now();
         let mut out: FxHashMap<(Id, i64), [u8; 32]> = FxHashMap::default();
         for (exp, g) in groups {
             // another request may have computed some of them meanwhile
@@ -267,14 +232,12 @@ async fn run_batch(mut jobs: Vec<Job>, signer: &'static Signer, backend: Backend
             if todo.is_empty() {
                 continue;
             }
-            STATS.batch_computed.fetch_add(todo.len() as u64, Relaxed);
             let sigs = sign::compute_batch(backend, &todo, exp);
             for ((img, _), s) in todo.iter().zip(sigs) {
                 signer.insert(*img, exp, s);
                 out.insert((*img, exp), s);
             }
         }
-        STATS.verify_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         out
     })
     .await
@@ -288,26 +251,6 @@ async fn run_batch(mut jobs: Vec<Job>, signer: &'static Signer, backend: Backend
     }
 }
 
-pub fn stats_json() -> serde_json::Value {
-    let g = |a: &AtomicU64| a.load(Relaxed);
-    let b = g(&STATS.batches);
-    serde_json::json!({
-        "share_frames_sent": g(&STATS.frames_sent),
-        "share_entries_sent": g(&STATS.entries_sent),
-        "share_entries_dropped": g(&STATS.entries_dropped),
-        "verify_batches": b,
-        "verify_batch_jobs": g(&STATS.batch_jobs),
-        "verify_batch_computed": g(&STATS.batch_computed),
-        "verify_batch_avg_jobs": if b == 0 { 0.0 } else { g(&STATS.batch_jobs) as f64 / b as f64 },
-        "render_batches": g(&STATS.render_batches),
-        "render_queue_ms": g(&STATS.render_queue_us) as f64 / 1000.0,
-        "render_compute_ms": g(&STATS.render_compute_us) as f64 / 1000.0,
-        "verify_queue_ms": g(&STATS.verify_queue_us) as f64 / 1000.0,
-        "verify_compute_ms": g(&STATS.verify_compute_us) as f64 / 1000.0,
-        "cache_wakeups": g(&STATS.cache_wakeups),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +261,7 @@ mod tests {
             let signer: &'static Signer = Box::leak(Box::new(Signer::new(1)));
             let batcher: &'static VerifyBatcher = Box::leak(Box::new(VerifyBatcher::with_backend(Backend::Scalar, lanes)));
             batcher.start(signer);
+            signer.enable_sharing();
             let image = Id::new_v4();
             let exp = 1_900_000_000;
             let key = [27; 32];
@@ -328,7 +272,7 @@ mod tests {
             assert!(!request.is_finished());
             signer.insert_peer(&[(image, exp, sig)]);
             assert_eq!(tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap(), sig);
-            assert_eq!(signer.stats.computed.load(Relaxed), 0);
+            assert!(signer.take_outbox().is_empty(), "peer cache completion must not compute and share a new signature");
         }
     }
 
@@ -337,7 +281,6 @@ mod tests {
         let signer: &'static Signer = Box::leak(Box::new(Signer::new(1)));
         let b: &'static VerifyBatcher = Box::leak(Box::new(VerifyBatcher::with_backend(Backend::Scalar, 8)));
         b.start(signer);
-        let before = STATS.batches.load(Relaxed);
         let imgs: Vec<Id> = (0..10).map(|_| Id::new_v4()).collect();
         let mut hs = Vec::new();
         for i in 0..24 {
@@ -350,7 +293,6 @@ mod tests {
             assert_eq!(s, sign::compute(&[3u8; 32], img, exp));
             assert_eq!(signer.peek(img, exp), Some(s));
         }
-        assert!(STATS.batches.load(Relaxed) - before < 24, "jobs were batched");
     }
 
     #[test]

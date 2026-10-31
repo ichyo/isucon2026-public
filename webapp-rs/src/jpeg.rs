@@ -29,10 +29,7 @@ pub fn decode_sync(data: &[u8]) -> Option<Dims> {
     match fast::validate(data) {
         Some(d) => Some(d),
         // jpeg-decoder panics on some malformed inputs (Go's image/jpeg returns an error): treat as invalid
-        None => std::panic::catch_unwind(|| decode_jd(data)).unwrap_or_else(|_| {
-            eprintln!("[jpeg] jpeg-decoder panicked on a {}-byte upload; treated as invalid", data.len());
-            None
-        }),
+        None => std::panic::catch_unwind(|| decode_jd(data)).unwrap_or(None),
     }
 }
 
@@ -64,12 +61,8 @@ pub fn decode_full_sync(data: &[u8]) -> Option<Dims> {
 
 /// Decode in the blocking pool, at most `ISUREAL_JPEG_CONCURRENCY` at a time (CPU budget, rt.rs).
 pub async fn decode(data: Bytes) -> Option<Dims> {
-    let t0 = std::time::Instant::now();
     let _permit = crate::rt::jpeg_permits().acquire().await.ok()?;
-    let t1 = std::time::Instant::now();
-    let r = tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten();
-    crate::metrics::add_jpeg(t1 - t0, t1.elapsed());
-    r
+    tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten()
 }
 
 /// Entropy-decode-only validator mirroring jpeg-decoder 0.3.2 (`decoder.rs`, `parser.rs`, `huffman.rs`).

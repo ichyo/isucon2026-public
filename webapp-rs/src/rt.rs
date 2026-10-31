@@ -26,18 +26,6 @@ static SIGN: OnceLock<Semaphore> = OnceLock::new();
 // independently and only accepts one SIMD pass (or a handful of scalar signatures) at a time.
 static SIGN_SMALL: OnceLock<Semaphore> = OnceLock::new();
 static WARNED: AtomicBool = AtomicBool::new(false);
-/// 0 = not tried, 1 = raised, 2 = failed
-static PRIO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Whether the replication threads got their elevated priority ("raised" / "failed" / "n/a").
-pub fn prio_state() -> &'static str {
-    match PRIO.load(Ordering::Relaxed) {
-        1 => "raised",
-        2 => "failed",
-        _ => "n/a",
-    }
-}
-
 pub fn cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)
 }
@@ -49,9 +37,6 @@ pub fn set_thread_nice(nice: i32) -> bool {
         // SAFETY: plain syscalls on the current thread.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
         let ok = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) } == 0;
-        if nice < 0 {
-            PRIO.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
-        }
         if !ok && nice < 0 && !WARNED.swap(true, Ordering::Relaxed) {
             eprintln!("[rt] WARN cannot raise replication thread priority to nice {nice}: {} (grant CAP_SYS_NICE via AmbientCapabilities)", std::io::Error::last_os_error());
         }

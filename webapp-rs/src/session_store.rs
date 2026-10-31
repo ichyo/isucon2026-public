@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -49,18 +49,6 @@ struct Queued {
     encoded: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
-pub struct Stats {
-    pub records: u64,
-    pub batches: u64,
-    pub syncs: u64,
-    pub disk_us: u64,
-    pub disk_max_us: u64,
-    pub commit_wait_us: u64,
-    pub commit_wait_max_us: u64,
-    pub failures: u64,
-}
-
 struct Inner {
     values: FxHashMap<(u64, Id, u64), Option<Id>>,
     tokens: FxHashMap<(u64, Id), Id>,
@@ -71,7 +59,8 @@ struct Inner {
     enqueued: u64,
     completed: u64,
     flushing: bool,
-    stats: Stats,
+    #[cfg(test)]
+    syncs: u64,
     /// Once durability is uncertain, stop exposing any valid token until the process is restarted.
     poisoned: bool,
 }
@@ -176,12 +165,6 @@ impl SessionStore {
         !self.inner.lock().poisoned
     }
 
-    /// Cumulative counters since opening the journal. Disk time excludes the batch collection delay;
-    /// commit wait includes queueing and durability, but never application-level per-user lock waits.
-    pub fn stats(&self) -> Stats {
-        self.inner.lock().stats
-    }
-
     #[cfg(test)]
     pub(crate) fn pause_next_sync(
         &self,
@@ -231,7 +214,8 @@ impl SessionStore {
             enqueued: 0,
             completed: 0,
             flushing: false,
-            stats: Stats::default(),
+            #[cfg(test)]
+            syncs: 0,
             poisoned: false,
         };
         let mut end = MAGIC.len() as u64;
@@ -315,7 +299,6 @@ impl SessionStore {
     }
 
     fn persist(&self, record: Record) -> io::Result<()> {
-        let started = Instant::now();
         let encoded = encode(&record)?;
         let mut inner = self.inner.lock();
         inner.check(&record)?;
@@ -342,9 +325,6 @@ impl SessionStore {
                 return Err(poisoned());
             }
             if inner.completed >= ticket {
-                let elapsed = started.elapsed().as_micros() as u64;
-                inner.stats.commit_wait_us += elapsed;
-                inner.stats.commit_wait_max_us = inner.stats.commit_wait_max_us.max(elapsed);
                 return Ok(());
             }
             if inner.flushing {
@@ -365,7 +345,6 @@ impl SessionStore {
             for q in &batch {
                 bytes.extend_from_slice(&q.encoded);
             }
-            let disk_started = Instant::now();
             let result =
                 {
                     let mut file = self.file.lock();
@@ -382,18 +361,15 @@ impl SessionStore {
                         }
                     })
                 };
-            let disk_us = disk_started.elapsed().as_micros() as u64;
             inner = self.inner.lock();
-            inner.stats.disk_us += disk_us;
-            inner.stats.disk_max_us = inner.stats.disk_max_us.max(disk_us);
             if result.is_err() {
-                inner.stats.failures += 1;
                 inner.poisoned = true;
                 inner.queue.clear();
             } else {
-                inner.stats.records += batch.len() as u64;
-                inner.stats.batches += 1;
-                inner.stats.syncs += u64::from(self.fsync);
+                #[cfg(test)]
+                {
+                    inner.syncs += u64::from(self.fsync);
+                }
                 for q in &batch {
                     inner.apply(&q.record);
                     if let Record::Freeze {
@@ -440,6 +416,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     struct TempDir(std::path::PathBuf);
     impl TempDir {
@@ -533,15 +510,14 @@ mod tests {
         // The first batch is paused before disk I/O. All remaining records are enqueued for the
         // next batch, so this verifies batching deterministically rather than relying on timing.
         wait_until(|| s.inner.lock().enqueued == records.len() as u64);
-        assert_eq!(s.stats().records, 0);
+        assert_eq!(s.inner.lock().completed, 0);
         assert!(records.iter().all(|&(user, _)| s.get(1, user, 0).is_none()));
         release.send(()).unwrap();
         for writer in writers {
             writer.join().unwrap().unwrap();
         }
-        assert_eq!(s.stats().records, records.len() as u64);
-        assert_eq!(s.stats().batches, 2);
-        assert_eq!(s.stats().syncs, 2);
+        assert_eq!(s.inner.lock().completed, records.len() as u64);
+        assert_eq!(s.inner.lock().syncs, 2);
         drop(s);
         let reopened = SessionStore::open(&dir.0, true).unwrap();
         for (user, token) in records {
@@ -585,8 +561,7 @@ mod tests {
         assert!(!s.healthy());
         assert_eq!(s.get(1, user, 0), Some(None));
         assert_eq!(s.identify(1, token), None);
-        assert_eq!(s.stats().records, 1);
-        assert_eq!(s.stats().failures, 1);
+        assert_eq!(s.inner.lock().completed, 1);
     }
 
     #[test]

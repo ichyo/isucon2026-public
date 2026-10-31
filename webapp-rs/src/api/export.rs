@@ -49,7 +49,6 @@ pub async fn export_posts(ctx: Ctx, req: Req) -> HResult {
             }
         }
         let zip = Bytes::from(build_zip(&images, &json, now_us()));
-        crate::compressionlog::export(&req, &zip, &images);
         Ok(zip)
     })
     .await
