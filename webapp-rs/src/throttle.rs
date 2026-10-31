@@ -97,6 +97,26 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             eprintln!("[throttle] set ms={ms} feed_ms={f}");
             text(200, format!("{{\"ms\":{ms},\"feed_ms\":{f}}}"))
         }
+        ("GET" | "POST", "/uploadgate") => {
+            use crate::http::req as r;
+            use std::sync::atomic::Ordering::Relaxed;
+            if method == hyper::Method::POST {
+                match q(&query, "slots").map(|v| v.parse::<usize>()) {
+                    Some(Ok(n)) => {
+                        r::set_gate_slots(n);
+                        eprintln!("[uploadgate] slots={n}");
+                    }
+                    _ => return Ok(text(400, "{\"error\":\"bad slots\"}".into())),
+                }
+            }
+            text(200, format!(
+                "{{\"slots\":{},\"passes\":{},\"waits\":{},\"wait_ms_total\":{}}}",
+                r::gate_slots(),
+                r::GATE_PASSES.load(Relaxed),
+                r::GATE_WAITS.load(Relaxed),
+                r::GATE_WAIT_US.load(Relaxed) / 1000
+            ))
+        }
         ("GET", "/status") => text(200, app.status_json()),
         ("GET", "/metrics") => {
             let (role, repl) = match &app.repl {

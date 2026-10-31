@@ -72,6 +72,65 @@ async fn reserve(bytes: u64) -> Option<BudgetGuard> {
     Some(BudgetGuard { _permit: permit, bytes })
 }
 
+// ---- upload gate (FIFO admission of large bodies) ---------------------------------------------------------
+
+/// At most `slots` bodies > SMALL_DRAIN are received at once, admitted in arrival order (tokio's semaphore is
+/// fair); the others wait unread so their (small, ISUREAL_RCVBUF) receive windows close and the router's
+/// per-region bandwidth goes to the admitted ones: uploads complete one after another instead of all at the end.
+/// 0 = off (ISUREAL_UPLOAD_SLOTS; runtime: POST control /uploadgate?slots=N).
+static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+static GATE_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub static GATE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATE_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn gate() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(0)))
+}
+
+pub fn gate_slots() -> usize {
+    GATE_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resizes the gate (shrinking takes effect as admitted uploads finish).
+pub fn set_gate_slots(n: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _l = GATE_LOCK.lock();
+    let cur = GATE_SLOTS.load(Relaxed);
+    if n > cur {
+        gate().add_permits(n - cur);
+    } else if n < cur {
+        let sem = gate().clone();
+        let k = (cur - n) as u32;
+        tokio::spawn(async move {
+            if let Ok(p) = sem.acquire_many(k).await {
+                p.forget();
+            }
+        });
+    }
+    GATE_SLOTS.store(n, Relaxed);
+}
+
+async fn gate_enter() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if gate_slots() == 0 {
+        return None;
+    }
+    GATE_PASSES.fetch_add(1, Relaxed);
+    let sem = gate().clone();
+    match sem.clone().try_acquire_owned() {
+        Ok(p) => Some(p),
+        Err(_) => {
+            let t = std::time::Instant::now();
+            GATE_WAITS.fetch_add(1, Relaxed);
+            let p = sem.acquire_owned().await.ok();
+            GATE_WAIT_US.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            p
+        }
+    }
+}
+
 /// Result of a capped body read.
 pub enum Capped {
     Body(Bytes),
@@ -227,6 +286,8 @@ impl Req {
             return Ok(Capped::Rejected);
         }
         let want = declared.map_or(cap as u64, |n| n.min(cap as u64));
+        // held until the body is fully received (or rejected), not until the response
+        let _gate = if want > SMALL_DRAIN as u64 { gate_enter().await } else { None };
         if self.budget.is_none() {
             self.budget = reserve(want).await;
         }

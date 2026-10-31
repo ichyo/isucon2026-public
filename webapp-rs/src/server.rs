@@ -44,9 +44,14 @@ pub fn wire_blob_peers(nodes: &[&Node]) {
 }
 
 /// TcpListener with a larger accept backlog than std's default 128 (bursts of new connections).
-async fn bind_backlog(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
+/// `rcvbuf` > 0 fixes SO_RCVBUF of the listener (accepted connections inherit it; no autotuning): a request whose
+/// body we do not read yet then holds only that much in flight (upload gate, ISUREAL_RCVBUF).
+async fn bind_backlog(addr: &str, backlog: u32, rcvbuf: u32) -> std::io::Result<TcpListener> {
     let sa = tokio::net::lookup_host(addr).await?.next().ok_or_else(|| std::io::Error::other(format!("cannot resolve {addr}")))?;
     let sock = if sa.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    if rcvbuf > 0 {
+        sock.set_recv_buffer_size(rcvbuf)?;
+    }
     sock.set_reuseaddr(true)?;
     sock.set_nodelay(true)?;
     sock.bind(sa)?;
@@ -214,7 +219,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         }
     });
 
-    let l = bind_backlog(&app.cfg.listen, 4096).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
+    let rcvbuf: u32 = std::env::var("ISUREAL_RCVBUF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    crate::http::req::set_gate_slots(std::env::var("ISUREAL_UPLOAD_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    eprintln!("[start] upload gate: slots={} rcvbuf={rcvbuf} (change slots: curl -XPOST '{}/uploadgate?slots=N')", crate::http::req::gate_slots(), app.cfg.control_listen);
+    let l = bind_backlog(&app.cfg.listen, 4096, rcvbuf).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
     let http_addr = l.local_addr()?;
     tokio::spawn(crate::http::serve(app, l));
     eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} blob={blob_addr:?} control={control_addr:?} in {:.1?}", t0.elapsed());
