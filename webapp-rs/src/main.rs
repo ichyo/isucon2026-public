@@ -1,5 +1,9 @@
 use isureal::config::Config;
 
+// mimalloc keeps freed memory for reuse: large upload bodies (0.5-32 MB) no longer mmap/zero fresh pages each time.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let cfg = match Config::from_env() {
         Ok(c) => c,
