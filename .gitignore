@@ -4,3 +4,4 @@ target/
 .DS_Store
 results/**/*.log.gz
 .claude/
+__pycache__/
