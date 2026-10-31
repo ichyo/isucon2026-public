@@ -236,13 +236,21 @@ impl Leader {
             app.handle_effects(&st, &fx);
             (outcome, wal.epoch, wal.last_seq, lsn, links)
         };
-        if policy == WaitPolicy::AllReplicas {
-            // every connected follower (also one still catching up: it applies these right after its
-            // catch-up stream) must have applied the records before the client sees success
-            for link in links.iter() {
-                if !link.is_dead() {
-                    link.wait_applied(epoch, seq).await;
-                }
+        // AllReplicas: every connected follower (also one still catching up: it applies these right after its
+        // catch-up stream) must have applied the records before the client sees success.
+        // LeaderOnly (ISUREAL_ASYNC_ACTIONS): only cross-region followers are skipped — followers in the region
+        // of the origin node or of the leader are still waited for (HAProxy spreads one user's requests over
+        // asia1/asia2); the origin follower itself applies the records before it answers.
+        let origin_link = match origin {
+            Origin::Link { link, .. } => Some(link),
+            Origin::Local => None,
+        };
+        let origin_region = origin_link.and_then(|id| links.iter().find(|l| l.id == id)).map_or(app.cfg.region, |l| l.node.region());
+        for link in links.iter() {
+            let must_wait = policy == WaitPolicy::AllReplicas
+                || (Some(link.id) != origin_link && (link.node.region() == origin_region || link.node.region() == app.cfg.region));
+            if must_wait && !link.is_dead() {
+                link.wait_applied(epoch, seq).await;
             }
         }
         app.wal.wait_synced(lsn).await;
