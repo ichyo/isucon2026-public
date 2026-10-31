@@ -1,5 +1,6 @@
 //! ISUReal — in-memory, multi-region replicated re-implementation. See docs/design.md.
 
+pub mod accesslog;
 pub mod api;
 pub mod app;
 pub mod apply;

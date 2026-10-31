@@ -91,6 +91,14 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     let mut action_id = metrics::A_NOT_FOUND;
     let mut repl = (0u64, 0u64);
     let req_bytes = content_length(&parts.headers);
+    let alog_token: Option<String> = crate::accesslog::enabled().then(|| {
+        let v = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        let ua = parts.headers.get(http::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        let cc = parts.headers.get("x-country-code").and_then(|v| v.to_str().ok()).unwrap_or("-");
+        let ua: String = ua.chars().take(60).map(|c| if c == '\t' { ' ' } else { c }).collect();
+        format!("{}\t{}\t{}", &v[v.len().saturating_sub(8)..], cc, ua)
+    });
+    let mut alog_body_us: i64 = -1;
 
     let too_large = parts
         .headers
@@ -163,6 +171,7 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     )
                     .await;
                 repl = rw;
+                alog_body_us = ph.body_recv_us.map_or(-1, |v| v as i64);
                 app.metrics.record_phases(action_id, ph);
                 match result {
                     Ok(r) => r,
@@ -203,6 +212,24 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         _ => 0,
     };
     app.metrics.record(action_id, resp.status, start.elapsed(), repl, req_bytes, resp_bytes);
+    if let Some(tok) = &alog_token {
+        let dur = start.elapsed().as_micros() as u64;
+        crate::accesslog::write(format_args!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            now_us() - dur as i64,
+            dur,
+            alog_body_us,
+            repl.0,
+            resp.status,
+            parts.method,
+            action,
+            ip,
+            tok,
+            req_bytes,
+            resp_bytes,
+            path
+        ));
+    }
     if let Some(d) = app.throttle.delay(kind) {
         tokio::time::sleep(d).await;
     }
