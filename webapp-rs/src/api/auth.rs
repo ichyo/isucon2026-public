@@ -87,14 +87,25 @@ pub fn exec_login(st: &State, tx: &mut Tx, username: &str, secret_key: &str) -> 
 }
 
 // ---------------------------------------------------------------------------------------------
-// POST /api/auth/logout — auth user, not pinned. TODO(group A)
+// POST /api/auth/logout — auth user, not pinned. Invalidates the presented session only.
 // ---------------------------------------------------------------------------------------------
 
-pub async fn logout(_ctx: Ctx, _req: Req) -> HResult {
-    Err(ApiError::not_implemented())
+pub async fn logout(ctx: Ctx, req: Req) -> HResult {
+    let me = ctx.auth_user(&req)?;
+    ctx.write(Command::Logout { token: me.token }).await?;
+    Ok(Resp::no_content())
 }
 
-/// Emits `LogEntry::SessionEnded { token }`.
-pub fn exec_logout(_st: &State, _tx: &mut Tx, _token: Id) -> ExecResult {
-    Err(ApiError::not_implemented())
+/// Emits `LogEntry::SessionEnded { token }`. The session must still be active when the leader executes it
+/// (a concurrent re-login / account deletion already ended it ⇒ 401, as if the request came after it).
+pub fn exec_logout(st: &State, tx: &mut Tx, token: Id) -> ExecResult {
+    st.session_user(token).ok_or(ApiError::unauthorized("invalid_session"))?;
+    tx.push(LogEntry::SessionEnded { token });
+    Ok(Outcome::Unit)
+}
+
+/// The acting user of a write must still be active when the leader executes it (it may have been deleted
+/// between the handler's auth check and the exec) ⇒ else 401 invalid_session.
+pub fn active_actor(st: &State, actor: Id) -> Result<UIdx, ApiError> {
+    st.user_idx(actor).filter(|&u| st.user(u).is_active()).ok_or(ApiError::unauthorized("invalid_session"))
 }
