@@ -38,6 +38,7 @@ pub struct App {
     pub router: Router,
     pub statics: StaticFiles,
     pub repl: Repl,
+    pub metrics: crate::metrics::Metrics,
 }
 
 /// The authenticated session user (copied out of the state; safe to keep across awaits).
@@ -174,10 +175,14 @@ impl App {
                 }
             }
         }
-        match &self.repl {
+        // replication wait for the request metrics: leader = submit → all acked, follower = forward round trip
+        let t = std::time::Instant::now();
+        let r = match &self.repl {
             Repl::Leader(l) => l.submit(self, cmd, crate::repl::Origin::Local, policy).await,
             Repl::Follower(f) => f.forward(cmd).await,
-        }
+        };
+        crate::metrics::add_repl_wait(t.elapsed());
+        r
     }
 
     /// Effects of applied entries; called with the write lock held (`st` = the new state).

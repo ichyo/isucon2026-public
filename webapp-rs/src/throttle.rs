@@ -98,6 +98,11 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             text(200, format!("{{\"ms\":{ms},\"feed_ms\":{f}}}"))
         }
         ("GET", "/status") => text(200, app.status_json()),
+        ("GET", "/metrics") => text(200, app.metrics.json(app.cfg.region.as_str(), if app.is_leader() { "leader" } else { "follower" })),
+        ("POST", "/metrics/reset") => {
+            app.metrics.reset();
+            text(200, "{\"reset\":true}".into())
+        }
         ("POST", "/debug/session") => {
             let Some(user) = q(&query, "user").and_then(|u| Id::parse(&u)) else {
                 return Ok(text(400, "{\"error\":\"user=<uuid> required\"}".into()));

@@ -87,6 +87,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         images,
         sse: SseHub::default(),
         bans: Bans::default(),
+        metrics: crate::metrics::Metrics::new(&Router::new().action_names()),
         router: Router::new(),
         statics,
         repl,
@@ -146,6 +147,15 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         }
         Err(e) => eprintln!("[start] WARN cannot bind control {}: {e}", app.cfg.control_listen),
     }
+
+    // per-second metrics timeline (process CPU%)
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            iv.tick().await;
+            app.metrics.tick();
+        }
+    });
 
     // housekeeping
     tokio::spawn(async move {

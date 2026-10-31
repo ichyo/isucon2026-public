@@ -13,6 +13,7 @@ pub mod images;
 pub mod jpeg;
 pub mod json;
 pub mod loader;
+pub mod metrics;
 pub mod model;
 pub mod repl;
 pub mod rules;
