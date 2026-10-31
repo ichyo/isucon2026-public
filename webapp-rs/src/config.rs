@@ -63,8 +63,9 @@ pub struct Config {
     /// ISUREAL_GATE_SILENCE_MS: a follower stops serving after this long without any frame from the leader
     /// (must stay well below the leader's 25 s drop timeout)
     pub gate_silence_ms: u64,
-    /// ISUREAL_JPEG_CONCURRENCY / ISUREAL_SIGN_CONCURRENCY (0 = number of CPUs)
+    /// ISUREAL_JPEG_CONCURRENCY: total JPEG slots (0 = CPUs, minimum 2); one reserved for small images.
     pub jpeg_concurrency: usize,
+    /// ISUREAL_SIGN_CONCURRENCY (0 = number of CPUs)
     pub sign_concurrency: usize,
     /// ISUREAL_BODY_BUDGET_MB: global budget for buffered request bodies (requests wait beyond it)
     pub body_budget_mb: u64,

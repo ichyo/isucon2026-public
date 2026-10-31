@@ -30,7 +30,7 @@ pub async fn replace_real_moji(ctx: Ctx, mut req: Req) -> HResult {
     let image = body.file("image").ok_or_else(invalid)?.data.clone();
     drop(body);
     let reaction = reaction.as_deref().and_then(Reaction::parse).ok_or_else(invalid)?;
-    let dims = jpeg::decode(image.clone()).await.ok_or_else(invalid)?;
+    let dims = jpeg::decode(image.clone(), jpeg::Lane::Small).await.ok_or_else(invalid)?;
     if dims.width > MAX_DIM || dims.height > MAX_DIM {
         return Err(invalid());
     }

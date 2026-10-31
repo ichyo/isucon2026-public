@@ -16,6 +16,7 @@
 //! corpus of valid and corrupted variants (truncations, bit/byte flips, marker edits, …).
 
 use bytes::Bytes;
+pub use crate::rt::JpegLane as Lane;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dims {
@@ -62,12 +63,25 @@ pub fn decode_full_sync(data: &[u8]) -> Option<Dims> {
     Some(Dims { width: info.width, height: info.height })
 }
 
-/// Decode in the blocking pool, at most `ISUREAL_JPEG_CONCURRENCY` at a time (CPU budget, rt.rs).
-pub async fn decode(data: Bytes) -> Option<Dims> {
+/// Decode in the blocking pool using the post or small-image CPU budget (rt.rs).
+pub async fn decode(data: Bytes, lane: Lane) -> Option<Dims> {
+    decode_with_permits(data, crate::rt::jpeg_permits(lane)).await
+}
+
+async fn decode_with_permits(data: Bytes, permits: &std::sync::Arc<tokio::sync::Semaphore>) -> Option<Dims> {
     let t0 = std::time::Instant::now();
-    let _permit = crate::rt::jpeg_permits().acquire().await.ok()?;
+    let permit = permits.clone().acquire_owned().await.ok()?;
     let t1 = std::time::Instant::now();
-    let r = tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten();
+    let r = tokio::task::spawn_blocking(move || {
+        let result = decode_sync(&data);
+        // Free the CPU slot on actual completion, even if the request runtime is stalled or the
+        // request was cancelled. A cancelled async waiter must not free a still-running decode.
+        drop(permit);
+        result
+    })
+    .await
+    .ok()
+    .flatten();
     crate::metrics::add_jpeg(t1 - t0, t1.elapsed());
     r
 }
@@ -879,6 +893,55 @@ mod fast {
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn check_decode_permit_lifetime(cancel_request: bool) {
+        use std::future::Future;
+        use std::sync::{mpsc, Arc};
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let rt = tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).build().unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        rt.block_on(async {
+            // Hold the only blocking worker so the real decoder is queued deterministically.
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut decode = Box::pin(decode_with_permits(Bytes::from_static(b"not a jpeg"), &permits));
+            let initial = std::future::poll_fn(|cx| Poll::Ready(decode.as_mut().poll(cx))).await;
+            assert!(initial.is_pending());
+            assert_eq!(permits.available_permits(), 0);
+            if cancel_request {
+                drop(decode);
+                assert_eq!(permits.available_permits(), 0, "cancellation must not free a queued or running decode");
+            }
+
+            // This task runs after the decoder on the sole blocking worker. Waiting synchronously
+            // keeps the request runtime from resuming the async decode future in the meantime.
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let finished = tokio::task::spawn_blocking(move || finished_tx.send(()).unwrap());
+            release_tx.send(()).unwrap();
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(permits.available_permits(), 1, "completion must free the permit without polling the request again");
+            blocker.await.unwrap();
+            finished.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn decode_releases_permit_before_request_resumes() {
+        check_decode_permit_lifetime(false);
+    }
+
+    #[test]
+    fn cancelled_decode_keeps_permit_until_blocking_work_finishes() {
+        check_decode_permit_lifetime(true);
+    }
 
     fn samples() -> Vec<Vec<u8>> {
         let mut out = Vec::new();
