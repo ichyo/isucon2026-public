@@ -35,7 +35,12 @@ pub async fn serve(app: &'static App, listener: TcpListener) {
         let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| handle(app, req, peer));
-            let _ = hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(stream), svc).await;
+            // no header-read / idle / body timeouts: slow uploads through the router can take tens of seconds
+            let _ = hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
+                .header_read_timeout(None)
+                .serve_connection(TokioIo::new(stream), svc)
+                .await;
         });
     }
 }
@@ -55,6 +60,7 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     let start = Instant::now();
     let ip = client_ip(&req, peer);
     let (parts, body) = req.into_parts();
+    let body: req::BodySlot = std::sync::Arc::new(parking_lot::Mutex::new(Some(body)));
     let path = parts.uri.path().to_string();
     let kind = throttle::kind_of(&path);
     let mut action = "-";
@@ -117,7 +123,7 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     params,
                     query: parts.uri.query().map(|s| s.to_string()),
                     headers: parts.headers,
-                    body: Some(body),
+                    body: body.clone(),
                     body_bytes: None,
                     ip: ip.clone(),
                     start,
@@ -145,6 +151,21 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         }
     };
 
+    // Like the reference (nginx buffers the whole request body before the app answers), never answer while the
+    // client is still uploading: consume whatever the handler did not read, so the connection stays open (an
+    // unread body makes hyper close it after the response — the router multiplexes many clients over its
+    // upstream keep-alive connections, so that close can hit someone else's next request as EOF).
+    // Only 413 (Content-Length > 32 MiB, like nginx) is answered without reading the body.
+    let drained = if action_id == metrics::A_TOO_LARGE {
+        if req_bytes > 0 {
+            req::Drain::Failed
+        } else {
+            req::Drain::None
+        }
+    } else {
+        req::drain(&body).await
+    };
+    app.metrics.record_drain(action_id, drained);
     let resp_bytes = match &resp.body {
         RespBody::Full(b) => b.len() as u64,
         _ => 0,

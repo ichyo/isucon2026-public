@@ -53,7 +53,21 @@ async fn bind_backlog(addr: &str, backlog: u32) -> std::io::Result<TcpListener> 
     sock.listen(backlog)
 }
 
+/// Logs panics (with location) once per process; the default hook output is kept too.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            eprintln!("[panic] thread {:?}: {info}", thread.name().unwrap_or("?"));
+            prev(info);
+        }));
+    });
+}
+
 pub async fn start(cfg: Config) -> anyhow::Result<Node> {
+    install_panic_hook();
     let t0 = Instant::now();
     eprintln!(
         "[start] node={} region={} leader_node={} role={:?} listen={} repl_listen={} leader_addr={} data={} initial={} public={} fsync={} exp_quantum={}",
