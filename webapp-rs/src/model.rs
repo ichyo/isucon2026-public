@@ -170,6 +170,66 @@ impl Region {
     }
 }
 
+/// A server (node) of the cluster. Several nodes may share a region (asia1 + asia2).
+/// Encoded as one byte (0..=3); values 0..=2 coincide with the old `Region` encoding of blob origins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct NodeId(pub u8);
+
+impl NodeId {
+    pub const ASIA1: NodeId = NodeId(0);
+    pub const EUROPE1: NodeId = NodeId(1);
+    pub const AMERICA1: NodeId = NodeId(2);
+    pub const ASIA2: NodeId = NodeId(3);
+    pub const COUNT: usize = 4;
+    pub const ALL: [NodeId; 4] = [NodeId::ASIA1, NodeId::EUROPE1, NodeId::AMERICA1, NodeId::ASIA2];
+
+    /// `asia1|asia2|europe1|america1`; a bare region name means that region's primary node.
+    pub fn parse(s: &str) -> Option<NodeId> {
+        match s {
+            "asia1" | "asia" => Some(NodeId::ASIA1),
+            "europe1" | "europe" => Some(NodeId::EUROPE1),
+            "america1" | "america" => Some(NodeId::AMERICA1),
+            "asia2" => Some(NodeId::ASIA2),
+            _ => None,
+        }
+    }
+    pub fn from_u8(v: u8) -> Option<NodeId> {
+        ((v as usize) < NodeId::COUNT).then_some(NodeId(v))
+    }
+    pub fn name(self) -> &'static str {
+        match self.0 {
+            0 => "asia1",
+            1 => "europe1",
+            2 => "america1",
+            3 => "asia2",
+            _ => "unknown",
+        }
+    }
+    pub fn region(self) -> Region {
+        match self.0 {
+            1 => Region::Europe,
+            2 => Region::America,
+            _ => Region::Asia,
+        }
+    }
+    /// The node that historically serves a region (asia1/europe1/america1).
+    pub fn primary(r: Region) -> NodeId {
+        NodeId(r as u8)
+    }
+    pub fn idx(self) -> usize {
+        self.0 as usize
+    }
+    /// Private IP of the contest server hosting this node.
+    pub fn private_ip(self) -> &'static str {
+        match self.0 {
+            1 => "192.168.2.10",
+            2 => "192.168.3.10",
+            3 => "192.168.4.10",
+            _ => "192.168.1.10",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum AccountType {
     Regular,
@@ -430,13 +490,14 @@ pub enum ImageLoc {
     /// large uploaded image in this node's durable blob store (this node is its origin)
     Blob { key: u64, off: u64, len: u32 },
     /// large uploaded image living in another node's blob store (fetched on demand + cached locally)
-    Remote { origin: Region, key: u64, off: u64, len: u32 },
+    Remote { origin: NodeId, key: u64, off: u64, len: u32 },
 }
 
 /// Reference to a large blob in its origin node's durable blob store (carried in the log instead of the bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobRef {
-    pub origin: Region,
+    /// node whose blobs.dat holds the bytes
+    pub origin: NodeId,
     /// random key also written in the blob's header (guards against reading a different blob)
     pub key: u64,
     /// offset of the data in the origin's blobs.dat
@@ -445,8 +506,8 @@ pub struct BlobRef {
 }
 
 impl BlobRef {
-    /// Where this blob is read from on a node of region `me`.
-    pub fn loc_on(&self, me: Region) -> ImageLoc {
+    /// Where this blob is read from on node `me`.
+    pub fn loc_on(&self, me: NodeId) -> ImageLoc {
         if self.origin == me {
             ImageLoc::Blob { key: self.key, off: self.off, len: self.len }
         } else {

@@ -98,7 +98,7 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             text(200, format!("{{\"ms\":{ms},\"feed_ms\":{f}}}"))
         }
         ("GET", "/status") => text(200, app.status_json()),
-        ("GET", "/metrics") => text(200, app.metrics.json(app.cfg.region.as_str(), if app.is_leader() { "leader" } else { "follower" })),
+        ("GET", "/metrics") => text(200, app.metrics.json(app.cfg.node.name(), if app.is_leader() { "leader" } else { "follower" })),
         ("POST", "/metrics/reset") => {
             app.metrics.reset();
             text(200, "{\"reset\":true}".into())

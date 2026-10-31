@@ -37,18 +37,29 @@ pub fn wire_blob_peers(nodes: &[&Node]) {
     for n in nodes {
         for m in nodes {
             if let Some(a) = m.blob_addr {
-                n.app.images.net.set_peer(m.app.cfg.region, a.to_string());
+                n.app.images.net.set_peer(m.app.cfg.node, a.to_string());
             }
         }
     }
 }
 
+/// TcpListener with a larger accept backlog than std's default 128 (bursts of new connections).
+async fn bind_backlog(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
+    let sa = tokio::net::lookup_host(addr).await?.next().ok_or_else(|| std::io::Error::other(format!("cannot resolve {addr}")))?;
+    let sock = if sa.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    sock.set_reuseaddr(true)?;
+    sock.set_nodelay(true)?;
+    sock.bind(sa)?;
+    sock.listen(backlog)
+}
+
 pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let t0 = Instant::now();
     eprintln!(
-        "[start] region={} leader_region={} role={:?} listen={} repl_listen={} leader_addr={} data={} initial={} public={} fsync={} exp_quantum={}",
+        "[start] node={} region={} leader_node={} role={:?} listen={} repl_listen={} leader_addr={} data={} initial={} public={} fsync={} exp_quantum={}",
+        cfg.node.name(),
         cfg.region.as_str(),
-        cfg.leader_region.as_str(),
+        cfg.leader_node.name(),
         cfg.role,
         cfg.listen,
         cfg.repl_listen,
@@ -95,7 +106,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
 
     // replay the local WAL
     {
-        let region = app.cfg.region;
+        let node = app.cfg.node;
         let t = Instant::now();
         let mut st = app.state.write();
         let mut fx = Vec::new();
@@ -104,7 +115,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
             .replay(|d, _rec, off| {
                 let loc = match d.blob {
                     BlobIn::Inline { off: o, len } => Some(ImageLoc::Wal { off: off + o as u64, len: len as u32 }),
-                    BlobIn::Ref(r) => Some(r.loc_on(region)),
+                    BlobIn::Ref(r) => Some(r.loc_on(node)),
                     _ => None,
                 };
                 apply(&mut st, &d.entry, loc, &mut fx);
@@ -168,7 +179,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         }
     });
 
-    let l = TcpListener::bind(&app.cfg.listen).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
+    let l = bind_backlog(&app.cfg.listen, 4096).await.with_context(|| format!("bind http {}", app.cfg.listen))?;
     let http_addr = l.local_addr()?;
     tokio::spawn(crate::http::serve(app, l));
     eprintln!("[start] ready: http={http_addr} repl={repl_addr:?} blob={blob_addr:?} control={control_addr:?} in {:.1?}", t0.elapsed());

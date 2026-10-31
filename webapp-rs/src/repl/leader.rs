@@ -39,7 +39,7 @@ fn mono_us() -> u64 {
 
 pub struct Link {
     pub id: u64,
-    pub region: Region,
+    pub node: NodeId,
     tx: mpsc::UnboundedSender<Bytes>,
     /// cumulative (epoch, seq) acked by the follower
     acked: watch::Sender<(u64, u64)>,
@@ -78,7 +78,7 @@ impl Link {
         self.acked.send_replace((a.epoch, a.seq));
         let t = *self.target.lock();
         if a.epoch == t.0 && a.seq >= t.1 && !self.in_sync.swap(true, Ordering::SeqCst) {
-            eprintln!("[repl] link {} ({}) caught up at seq {}", self.id, self.region.as_str(), a.seq);
+            eprintln!("[repl] link {} ({}) caught up at seq {}", self.id, self.node.name(), a.seq);
         }
     }
     /// true when `pred` holds within `timeout`; false on timeout or kill.
@@ -105,7 +105,7 @@ impl Link {
             }
             let el = t0.elapsed();
             if el >= ACK_TIMEOUT {
-                eprintln!("[repl] link {} ({}) did not ack seq {seq} within {:?}; dropping it", self.id, self.region.as_str(), ACK_TIMEOUT);
+                eprintln!("[repl] link {} ({}) did not ack seq {seq} within {:?}; dropping it", self.id, self.node.name(), ACK_TIMEOUT);
                 self.kill();
                 break;
             }
@@ -120,7 +120,7 @@ impl Link {
                 eprintln!(
                     "[repl] WARN slow ack: link {} ({}) seq {seq} not applied after {:.1?} (acked {}:{}, queued {} bytes)",
                     self.id,
-                    self.region.as_str(),
+                    self.node.name(),
                     el,
                     ae,
                     asq,
@@ -155,6 +155,10 @@ impl Leader {
             self.initialize(app).await?;
             return Ok(Outcome::Unit);
         }
+        if let Command::AbuseReport { ip, abuse } = &cmd {
+            app.count_abuse_globally(ip, *abuse);
+            return Ok(Outcome::Unit);
+        }
         let (outcome, epoch, seq, lsn, links) = {
             let mut st = app.state.write();
             let mut tx = Tx::new(now_us());
@@ -183,7 +187,7 @@ impl Leader {
                 let loc = match &blob {
                     None => None,
                     Some(Blob::Inline(b)) => blob_off.map(|o| ImageLoc::Wal { off: off + o as u64, len: b.len() as u32 }),
-                    Some(Blob::Stored(r)) => Some(r.loc_on(app.cfg.region)),
+                    Some(Blob::Stored(r)) => Some(r.loc_on(app.cfg.node)),
                 };
                 apply(&mut st, &entry, loc, &mut fx);
                 for (i, link) in links.iter().enumerate() {
@@ -242,7 +246,7 @@ impl Leader {
         super::drop_in_background(old);
         for l in &links {
             if !l.wait_ack(|&(e, _)| e == epoch, RESET_TIMEOUT).await && !l.is_dead() {
-                eprintln!("[repl] link {} ({}) did not ack reset; dropping it", l.id, l.region.as_str());
+                eprintln!("[repl] link {} ({}) did not ack reset; dropping it", l.id, l.node.name());
                 l.kill();
             }
         }
@@ -257,9 +261,9 @@ impl Leader {
             .map(|l| {
                 let (e, s) = *l.acked.borrow();
                 format!(
-                    "{{\"id\":{},\"region\":\"{}\",\"caught_up\":{},\"acked_epoch\":{},\"acked_seq\":{},\"queue_bytes\":{},\"max_ack_ms\":{:.1},\"slow_acks\":{},\"connected_s\":{}}}",
+                    "{{\"id\":{},\"node\":\"{}\",\"caught_up\":{},\"acked_epoch\":{},\"acked_seq\":{},\"queue_bytes\":{},\"max_ack_ms\":{:.1},\"slow_acks\":{},\"connected_s\":{}}}",
                     l.id,
-                    l.region.as_str(),
+                    l.node.name(),
                     l.in_sync.load(Ordering::SeqCst),
                     e,
                     s,
@@ -345,21 +349,30 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
         return Err(std::io::Error::other("expected HELLO"));
     }
     let hello: Hello = proto::decode(&payload)?;
-    if hello.leader_region != app.cfg.leader_region || hello.region == app.cfg.region {
+    if hello.leader_node != app.cfg.leader_node || hello.node == app.cfg.node || hello.region != hello.node.region() {
         eprintln!(
-            "[repl] !!!!! CONFIG MISMATCH: follower {} believes the leader region is {}, but this leader ({}) is configured with {} — refusing link !!!!!",
+            "[repl] !!!!! CONFIG MISMATCH: follower {} (region {}) believes the leader is {}, but this leader is {} configured with leader {} — refusing link !!!!!",
+            hello.node.name(),
             hello.region.as_str(),
-            hello.leader_region.as_str(),
-            app.cfg.region.as_str(),
-            app.cfg.leader_region.as_str()
+            hello.leader_node.name(),
+            app.cfg.node.name(),
+            app.cfg.leader_node.name()
         );
-        return Err(std::io::Error::other("leader region mismatch"));
+        return Err(std::io::Error::other("leader node mismatch"));
+    }
+    // a new connection from a node supersedes any older link of it (half-open after a crash/reboot):
+    // never wait 25 s for acks from a dead incarnation
+    let stale: Vec<Arc<Link>> = me.links.lock().iter().filter(|l| l.node == hello.node).cloned().collect();
+    for l in stale {
+        eprintln!("[repl] link {} ({}) superseded by a new connection; dropping it", l.id, l.node.name());
+        l.kill();
+        me.remove_link(l.id);
     }
     let (tx, rx) = mpsc::unbounded_channel();
     let id = me.next_link.fetch_add(1, Ordering::SeqCst);
     let link = Arc::new(Link {
         id,
-        region: hello.region,
+        node: hello.node,
         tx,
         acked: watch::channel((hello.epoch, hello.seq)).0,
         in_sync: AtomicBool::new(false),
@@ -390,7 +403,7 @@ async fn serve_link(app: &'static App, stream: TcpStream) -> std::io::Result<()>
     };
     eprintln!(
         "[repl] link {id} from {} (epoch {:016x} seq {}) -> {}catch-up {}..={} of epoch {:016x}",
-        hello.region.as_str(),
+        hello.node.name(),
         hello.epoch,
         hello.seq,
         if reset { "RESET + " } else { "" },

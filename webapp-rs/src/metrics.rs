@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 /// Non-route actions (ids 0..SPECIAL.len()); route actions follow in router order.
-pub const SPECIAL: [&str; 7] = ["static", "not_found", "method_not_allowed", "options", "banned", "too_large", "not_in_sync"];
+pub const SPECIAL: [&str; 8] = ["static", "not_found", "method_not_allowed", "options", "banned", "too_large", "not_in_sync", "health"];
 pub const A_STATIC: usize = 0;
 pub const A_NOT_FOUND: usize = 1;
 pub const A_METHOD_NOT_ALLOWED: usize = 2;
@@ -22,6 +22,7 @@ pub const A_OPTIONS: usize = 3;
 pub const A_BANNED: usize = 4;
 pub const A_TOO_LARGE: usize = 5;
 pub const A_NOT_IN_SYNC: usize = 6;
+pub const A_HEALTH: usize = 7;
 
 const NB: usize = 100;
 const RING: usize = 120;
