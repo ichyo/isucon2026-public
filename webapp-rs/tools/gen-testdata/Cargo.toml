@@ -1,0 +1,16 @@
+[package]
+name = "gen-testdata"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen-testdata"
+path = "src/main.rs"
+
+[dependencies]
+jpeg-encoder = "0.6"
+sha2 = "0.10"

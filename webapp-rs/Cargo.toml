@@ -1,0 +1,60 @@
+[workspace]
+members = [".", "tools/gen-testdata"]
+resolver = "2"
+
+[package]
+name = "isureal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "isureal"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = { version = "1.10", features = ["serde"] }
+caseless = "0.2"
+crc32fast = "1"
+csv = "1"
+flate2 = "1"
+form_urlencoded = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hmac = "0.12"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+jpeg-decoder = { version = "0.3", default-features = false }
+libc = "0.2"
+memmap2 = "0.9"
+multer = "3"
+parking_lot = "0.12"
+percent-encoding = "2"
+postcard = { version = "1", features = ["use-std"] }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["compress"] }
+smallvec = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+gen-testdata = { path = "tools/gen-testdata" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
