@@ -18,6 +18,7 @@ pub use resp::{Abuse, ApiError, HBody, HResult, Resp, RespBody};
 use router::Match;
 
 use crate::app::App;
+use crate::metrics;
 use crate::model::now_us;
 use crate::throttle;
 
@@ -39,6 +40,10 @@ pub async fn serve(app: &'static App, listener: TcpListener) {
     }
 }
 
+fn content_length(h: &http::HeaderMap) -> u64 {
+    h.get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 fn client_ip(req: &Request<Incoming>, peer: SocketAddr) -> String {
     match req.headers().get("x-client-ip").and_then(|v| v.to_str().ok()) {
         Some(v) if !v.is_empty() => v.to_string(),
@@ -53,6 +58,9 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     let path = parts.uri.path().to_string();
     let kind = throttle::kind_of(&path);
     let mut action = "-";
+    let mut action_id = metrics::A_NOT_FOUND;
+    let mut repl = (0u64, 0u64);
+    let req_bytes = content_length(&parts.headers);
 
     let too_large = parts
         .headers
@@ -62,13 +70,17 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         .is_some_and(|n| n > MAX_BODY as u64);
 
     let resp: Resp = if too_large {
+        action_id = metrics::A_TOO_LARGE;
         ApiError::new(413, "Request Entity Too Large").into_resp()
     } else if app.bans.is_banned(&ip, now_us()) {
+        action_id = metrics::A_BANNED;
         ApiError::forbidden("ip_banned").into_resp()
     } else if path.starts_with("/api/") && !follower_in_sync(app).await {
         // never answer from a replica that is known to be behind (link down / catching up / resetting)
+        action_id = metrics::A_NOT_IN_SYNC;
         ApiError::unavailable("replica not in sync").into_resp()
     } else if !path.starts_with("/api/") {
+        action_id = metrics::A_STATIC;
         if parts.method == Method::GET || parts.method == Method::HEAD {
             match app.statics.get(&path) {
                 Some((b, ct)) => Resp::bytes(200, ct, b),
@@ -80,10 +92,17 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
     } else {
         match app.router.find(&parts.method, &path) {
             Match::NotFound => ApiError::not_found("Not Found").into_resp(),
-            Match::MethodNotAllowed(allow) => ApiError::new(405, "Method Not Allowed").into_resp().header("allow", &allow),
-            Match::Options(allow) => Resp::no_content().header("allow", &allow),
+            Match::MethodNotAllowed(allow) => {
+                action_id = metrics::A_METHOD_NOT_ALLOWED;
+                ApiError::new(405, "Method Not Allowed").into_resp().header("allow", &allow)
+            }
+            Match::Options(allow) => {
+                action_id = metrics::A_OPTIONS;
+                Resp::no_content().header("allow", &allow)
+            }
             Match::Found(route, params) => {
                 action = route.name;
+                action_id = metrics::Metrics::route_action(route.idx);
                 let r = Req {
                     method: parts.method.clone(),
                     path: path.clone(),
@@ -95,7 +114,14 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
                     ip: ip.clone(),
                     start,
                 };
-                match (route.handler)(app, r).await {
+                let (result, rw) = metrics::REPL_WAIT
+                    .scope(std::cell::Cell::new((0, 0)), async move {
+                        let res = (route.handler)(app, r).await;
+                        (res, metrics::REPL_WAIT.with(|c| c.get()))
+                    })
+                    .await;
+                repl = rw;
+                match result {
                     Ok(r) => r,
                     Err(e) => {
                         if let Some(a) = e.abuse {
@@ -111,6 +137,11 @@ async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> 
         }
     };
 
+    let resp_bytes = match &resp.body {
+        RespBody::Full(b) => b.len() as u64,
+        _ => 0,
+    };
+    app.metrics.record(action_id, resp.status, start.elapsed(), repl, req_bytes, resp_bytes);
     if let Some(d) = app.throttle.delay(kind) {
         tokio::time::sleep(d).await;
     }

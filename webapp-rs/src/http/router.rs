@@ -32,6 +32,8 @@ pub struct Route {
     /// action name (spec §8.3)
     pub name: &'static str,
     pub handler: HandlerFn,
+    /// position in the routing table (metrics action id = metrics::SPECIAL.len() + idx)
+    pub idx: usize,
     segs: Vec<Seg>,
     lits: usize,
 }
@@ -52,7 +54,7 @@ pub struct Router {
 fn route(method: Method, pattern: &'static str, name: &'static str, handler: HandlerFn) -> Route {
     let segs: Vec<Seg> = pattern.trim_start_matches('/').split('/').map(|s| if s.starts_with(':') { Seg::Param } else { Seg::Lit(s) }).collect();
     let lits = segs.iter().filter(|s| matches!(s, Seg::Lit(_))).count();
-    Route { method, pattern, name, handler, segs, lits }
+    Route { method, pattern, name, handler, idx: 0, segs, lits }
 }
 
 const METHOD_ORDER: [Method; 6] = [Method::DELETE, Method::GET, Method::HEAD, Method::PATCH, Method::POST, Method::PUT];
@@ -107,7 +109,16 @@ impl Router {
             route(M::GET, "/api/images/:imageId", "get_image", h!(api::images::get_image)),
             route(M::GET, "/api/notifications", "get_notifications", h!(api::notifications::get_notifications)),
         ];
+        let mut routes = routes;
+        for (i, r) in routes.iter_mut().enumerate() {
+            r.idx = i;
+        }
         Router { routes }
+    }
+
+    /// Action names in routing-table order (for metrics).
+    pub fn action_names(&self) -> Vec<&'static str> {
+        self.routes.iter().map(|r| r.name).collect()
     }
 
     pub fn routes(&self) -> &[Route] {
