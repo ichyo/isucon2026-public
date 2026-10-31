@@ -1,0 +1,16 @@
+[Unit]
+Description=isureal-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/go
+EnvironmentFile=/home/isucon/env.sh
+ExecStart=/home/isucon/webapp/go/isureal
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
