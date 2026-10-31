@@ -209,7 +209,8 @@ impl App {
     /// Must be called with the clone already prepared; returns the old state (drop it off-thread).
     pub fn swap_state(&self, st: &mut State, fresh: State) -> State {
         self.bans.clear();
-        self.signer.clear();
+        // The signature cache survives initialize: entries are keyed by (image id, exp) and an image's
+        // owner (= signing key) never changes, so they stay valid; new images get fresh random ids.
         self.sse.close_all();
         std::mem::replace(st, fresh)
     }
