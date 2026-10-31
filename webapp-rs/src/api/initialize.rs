@@ -6,5 +6,6 @@ pub const INITIALIZE_RESPONSE: &str = "{\"language\":\"rust\",\"agent\":\"claude
 
 pub async fn initialize(ctx: Ctx, _req: Req) -> HResult {
     ctx.write(Command::Initialize).await?;
+    ctx.sigwarm.initialize(ctx).await;
     Ok(Resp::json(200, INITIALIZE_RESPONSE))
 }

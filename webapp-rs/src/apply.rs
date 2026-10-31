@@ -12,6 +12,7 @@ use crate::text;
 /// Side effects for the caller (handled while the write lock is still held, see App::handle_effects).
 #[derive(Debug, Clone)]
 pub enum Effect {
+    ImageCreated(Id, UIdx),
     /// a posting window opened: notify SSE subscribers of its region
     WindowOpened(WIdx),
     /// user deleted or region changed: close their SSE streams
@@ -112,6 +113,7 @@ pub fn apply(st: &mut State, e: &LogEntry, blob: Option<ImageLoc>, fx: &mut Vec<
             if let Some(img) = image {
                 let Some(loc) = blob else { warn_skip!("profile image {img} without blob") };
                 st.images.insert(*img, ImageMeta { kind: ImageKind::Profile, owner: u, ref_idx: u, loc });
+                fx.push(Effect::ImageCreated(*img, u));
             }
             let usr = &mut st.users[u as usize];
             usr.profile_image = *image;
@@ -258,6 +260,7 @@ pub fn apply(st: &mut State, e: &LogEntry, blob: Option<ImageLoc>, fx: &mut Vec<
             up.insert(pos, idx);
             st.windows[w as usize].posts.push(idx);
             st.images.insert(*image, ImageMeta { kind: ImageKind::Post, owner: a, ref_idx: idx, loc });
+            fx.push(Effect::ImageCreated(*image, a));
         }
         LogEntry::PostUpdated { id, caption, visibility, .. } => {
             let Some(p) = st.post_idx(*id) else { warn_skip!("update of unknown post {id}") };
@@ -324,6 +327,7 @@ pub fn apply(st: &mut State, e: &LogEntry, blob: Option<ImageLoc>, fx: &mut Vec<
             let rs = &st.realmojis;
             st.post_realmojis.insert_sorted(p, idx, |x, y| cmp_ts_id((rs[x as usize].created_at, rs[x as usize].id), (rs[y as usize].created_at, rs[y as usize].id)));
             st.images.insert(*image, ImageMeta { kind: ImageKind::RealMoji, owner: a, ref_idx: idx, loc });
+            fx.push(Effect::ImageCreated(*image, a));
         }
         LogEntry::RealMojiDeleted { id, at } => {
             let Some(r) = st.realmoji_idx(*id) else { warn_skip!("delete of unknown realmoji {id}") };

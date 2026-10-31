@@ -12,6 +12,8 @@
 //! ```
 
 use std::io::Write as _;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::Instant;
 
 use crate::model::{Date, Id, Ts};
 use crate::sign::{self, Signer, SIG_LEN};
@@ -178,6 +180,73 @@ impl JsonOut {
         self.pending.len()
     }
 
+    /// Patch work completed by another request, the background warmer, or a peer while this response
+    /// was waiting for CPU. No signature computation occurs here.
+    fn resolve_cached(&mut self) {
+        self.pending.retain(|(pos, image, _)| {
+            if let Some(sig) = self.signer.peek(*image, self.exp) {
+                self.buf[*pos..*pos + SIG_LEN].copy_from_slice(&sign::encode_sig(&sig));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Resolve misses in bounded passes, releasing the CPU budget between passes. Cache notifications
+    /// can complete a response even while every signing permit is occupied.
+    pub async fn finish_async(mut self) -> Result<Vec<u8>, tokio::task::JoinError> {
+        while !self.pending.is_empty() {
+            self.resolve_cached();
+            if self.pending.is_empty() {
+                break;
+            }
+            let permits = if self.pending.len() <= 8 { crate::rt::small_sign_permits() } else { crate::rt::sign_permits() };
+            let queued = Instant::now();
+            let acquire = permits.acquire();
+            tokio::pin!(acquire);
+            let permit = loop {
+                // Register first, then check: insertions between the check and the await cannot be lost.
+                let changed = self.signer.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.resolve_cached();
+                if self.pending.is_empty() {
+                    crate::sigshare::STATS.render_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
+                    return Ok(self.finish());
+                }
+                tokio::select! {
+                    p = &mut acquire => break p.expect("signature semaphore is never closed"),
+                    _ = &mut changed => { crate::sigshare::STATS.cache_wakeups.fetch_add(1, Relaxed); }
+                }
+            };
+            crate::sigshare::STATS.render_queue_us.fetch_add(queued.elapsed().as_micros() as u64, Relaxed);
+            // One SIMD pass at most, regardless of the number of URLs in a response. In particular,
+            // history responses no longer retain a semaphore permit for all their images.
+            let mut jobs = Vec::with_capacity(16);
+            for &(_, image, key) in &self.pending {
+                if !jobs.iter().any(|(i, _)| *i == image) {
+                    jobs.push((image, key));
+                    if jobs.len() == 16 {
+                        break;
+                    }
+                }
+            }
+            let signer = self.signer;
+            let exp = self.exp;
+            tokio::task::spawn_blocking(move || {
+                // Keep the permit with the actual CPU work, including when the client task is cancelled.
+                let _permit = permit;
+                let started = Instant::now();
+                signer.sign_many_serial(&jobs, exp);
+                crate::sigshare::STATS.render_compute_us.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                crate::sigshare::STATS.render_batches.fetch_add(1, Relaxed);
+            })
+            .await?;
+        }
+        Ok(self.finish())
+    }
+
     /// Computes missing signatures, patches them in, appends the trailing `\n`. CPU-heavy when
     /// `pending_signatures() > 0` — prefer `App::finish` (runs it in the blocking pool).
     pub fn finish(mut self) -> Vec<u8> {
@@ -269,6 +338,48 @@ pub fn write_f64_go(buf: &mut Vec<u8>, f: f64) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn waiting_json_finishes_on_peer_cache_without_a_permit() {
+        let signer: &'static Signer = Box::leak(Box::new(Signer::new(1)));
+        let image = Id::new_v4();
+        let key = [19; 32];
+        let exp = 1_900_000_000;
+        let sig = sign::compute(&key, image, exp);
+        let mut w = JsonOut::new(exp, signer);
+        w.image_url(image, &key);
+        let _busy = crate::rt::small_sign_permits().acquire().await.unwrap();
+        let request = tokio::spawn(w.finish_async());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!request.is_finished());
+        signer.insert_peer(&[(image, exp, sig)]);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), request).await.unwrap().unwrap().unwrap();
+        let expected = format!("\"/api/images/{image}?exp={exp}&sig={}\"\n", std::str::from_utf8(&sign::encode_sig(&sig)).unwrap());
+        assert_eq!(result, expected.into_bytes());
+        assert_eq!(signer.stats.computed.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_json_preserves_every_signature_and_duplicate() {
+        let signer: &'static Signer = Box::leak(Box::new(Signer::new(1)));
+        let mut w = JsonOut::new(12345, signer);
+        let mut expected = JsonOut::new(12345, signer);
+        w.arr();
+        expected.arr();
+        let jobs: Vec<_> = (0..37).map(|i| (Id::new_v4(), [i; 32])).collect();
+        for (image, key) in jobs.iter().chain(jobs.iter()) {
+            w.image_url(*image, key);
+            expected.image_url(*image, key);
+        }
+        w.end();
+        expected.end();
+        let result = w.finish_async().await.unwrap();
+        assert_eq!(result, expected.finish());
+        for (image, key) in jobs {
+            assert_eq!(signer.peek(image, 12345), Some(sign::compute(&key, image, 12345)));
+        }
+        assert_eq!(signer.stats.computed.load(Relaxed), 37);
+    }
+
     fn f(v: f64) -> String {
         let mut b = Vec::new();
         write_f64_go(&mut b, v);
@@ -312,12 +423,7 @@ mod tests {
         let out = String::from_utf8(w.finish()).unwrap();
         let sig = sign::encode_sig(&sign::compute(&[1u8; 32], Id::NIL, 100));
         let sig = std::str::from_utf8(&sig).unwrap();
-        assert_eq!(
-            out,
-            format!(
-                "{{\"a\":1,\"b\":[\"x\",true,null,{{}}],\"c\":{{\"d\":1.5}},\"e\":\"/api/images/00000000-0000-0000-0000-000000000000?exp=100&sig={sig}\"}}\n"
-            )
-        );
+        assert_eq!(out, format!("{{\"a\":1,\"b\":[\"x\",true,null,{{}}],\"c\":{{\"d\":1.5}},\"e\":\"/api/images/00000000-0000-0000-0000-000000000000?exp=100&sig={sig}\"}}\n"));
         // cached now
         let mut w = JsonOut::new(100, signer);
         w.image_url(Id::NIL, &[1u8; 32]);

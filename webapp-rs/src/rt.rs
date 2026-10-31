@@ -22,6 +22,9 @@ const REPL_THREADS: usize = 2;
 static REPL: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static JPEG: OnceLock<Semaphore> = OnceLock::new();
 static SIGN: OnceLock<Semaphore> = OnceLock::new();
+// A short request must not queue behind every pending feed/export batch. This lane is bounded
+// independently and only accepts one SIMD pass (or a handful of scalar signatures) at a time.
+static SIGN_SMALL: OnceLock<Semaphore> = OnceLock::new();
 static WARNED: AtomicBool = AtomicBool::new(false);
 /// 0 = not tried, 1 = raised, 2 = failed
 static PRIO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -50,10 +53,7 @@ pub fn set_thread_nice(nice: i32) -> bool {
             PRIO.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
         }
         if !ok && nice < 0 && !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[rt] WARN cannot raise replication thread priority to nice {nice}: {} (grant CAP_SYS_NICE via AmbientCapabilities)",
-                std::io::Error::last_os_error()
-            );
+            eprintln!("[rt] WARN cannot raise replication thread priority to nice {nice}: {} (grant CAP_SYS_NICE via AmbientCapabilities)", std::io::Error::last_os_error());
         }
         ok
     }
@@ -102,4 +102,8 @@ pub fn jpeg_permits() -> &'static Semaphore {
 
 pub fn sign_permits() -> &'static Semaphore {
     SIGN.get_or_init(|| Semaphore::new(cpus()))
+}
+
+pub fn small_sign_permits() -> &'static Semaphore {
+    SIGN_SMALL.get_or_init(|| Semaphore::new(1))
 }

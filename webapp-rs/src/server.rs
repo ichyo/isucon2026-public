@@ -117,6 +117,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         throttle: Throttle::new(cfg.throttle_ms, cfg.throttle_feed_ms),
         signer: Signer::new(cfg.exp_quantum),
         sigbatch: crate::sigshare::VerifyBatcher::default(),
+        sigwarm: crate::sigwarm::Warmer::default(),
         cfg,
         state: RwLock::new(live),
         pristine,
@@ -154,6 +155,8 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         let w = app.wal.inner.lock();
         eprintln!("[start] replayed {n} records (epoch {:016x}, seq {}) in {:.1?}; {}", w.epoch, w.last_seq, t.elapsed(), st.summary());
     }
+
+    app.sigwarm.start(app);
 
     // replication
     let mut repl_addr = None;

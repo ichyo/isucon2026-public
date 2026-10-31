@@ -7,7 +7,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -21,9 +21,7 @@ pub const ITERATIONS: usize = 1000;
 pub const URL_LIFETIME_S: i64 = 86400;
 pub const SIG_LEN: usize = 43;
 
-const IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
+const IV: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
 
 fn keyed_state(key: &[u8; 32], pad: u8) -> [u32; 8] {
     let mut block = [pad; 64];
@@ -172,6 +170,7 @@ pub struct SigStats {
     pub computed: AtomicU64,
     pub peer_received: AtomicU64,
     pub shared_dropped: AtomicU64,
+    pub precomputed: AtomicU64,
 }
 
 /// Newly computed signatures waiting to be pushed to the same-region peers (sigshare.rs).
@@ -180,14 +179,23 @@ pub const OUTBOX_MAX: usize = 65_536;
 pub struct Signer {
     cache: Mutex<FxHashMap<(Id, i64), Entry>>,
     quantum: i64,
+    purged_generation: AtomicI64,
     /// Some(..) when same-region sharing is enabled
     outbox: Mutex<Option<Vec<(Id, i64, [u8; 32])>>>,
     pub stats: SigStats,
+    pub changed: tokio::sync::Notify,
 }
 
 impl Signer {
     pub fn new(quantum: i64) -> Signer {
-        Signer { cache: Mutex::new(FxHashMap::default()), quantum: quantum.max(1), outbox: Mutex::new(None), stats: SigStats::default() }
+        Signer {
+            cache: Mutex::new(FxHashMap::default()),
+            quantum: quantum.max(1),
+            purged_generation: AtomicI64::new(i64::MIN),
+            outbox: Mutex::new(None),
+            stats: SigStats::default(),
+            changed: tokio::sync::Notify::new(),
+        }
     }
 
     /// `exp` for a response generated at `now_s` (spec: floor(now) + 86400; optionally quantized down).
@@ -221,6 +229,7 @@ impl Signer {
     pub fn insert(&self, image: Id, exp: i64, sig: [u8; 32]) {
         self.cache.lock().insert((image, exp), Entry { sig, peer: false });
         self.share(&[(image, exp, sig)]);
+        self.changed.notify_waiters();
     }
 
     fn share(&self, items: &[(Id, i64, [u8; 32])]) {
@@ -259,6 +268,8 @@ impl Signer {
         for &(img, exp, sig) in items {
             c.entry((img, exp)).or_insert(Entry { sig, peer: true });
         }
+        drop(c);
+        self.changed.notify_waiters();
     }
 
     /// Cached signature (computing + caching on miss). Expensive on miss (~0.1–0.5 ms): call off-lock.
@@ -292,6 +303,15 @@ impl Signer {
     /// Signs many (image, key) pairs for one exp; misses are computed in SIMD batches (`Backend::get()`) and
     /// split over the available cores when there are many.
     pub fn sign_many(&self, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
+        self.sign_many_impl(jobs, exp, true)
+    }
+
+    /// Bounded foreground chunks: one calling thread, never another pool of CPU workers.
+    pub fn sign_many_serial(&self, jobs: &[(Id, [u8; 32])], exp: i64) -> Vec<[u8; 32]> {
+        self.sign_many_impl(jobs, exp, false)
+    }
+
+    fn sign_many_impl(&self, jobs: &[(Id, [u8; 32])], exp: i64, parallel: bool) -> Vec<[u8; 32]> {
         let mut out = vec![[0u8; 32]; jobs.len()];
         let mut missing: Vec<usize> = Vec::new();
         // the same image often appears many times in one response (an author's profile image on every
@@ -317,7 +337,8 @@ impl Signer {
             return out;
         }
         let todo: Vec<(Id, [u8; 32])> = missing.iter().map(|&i| jobs[i]).collect();
-        let computed: Vec<(usize, [u8; 32])> = missing.iter().copied().zip(compute_parallel(Backend::get(), &todo, exp)).collect();
+        let computed: Vec<(usize, [u8; 32])> =
+            missing.iter().copied().zip(if parallel { compute_parallel(Backend::get(), &todo, exp) } else { compute_batch(Backend::get(), &todo, exp) }).collect();
         let mut fresh = Vec::with_capacity(computed.len());
         {
             let mut c = self.cache.lock();
@@ -328,15 +349,43 @@ impl Signer {
             }
         }
         self.share(&fresh);
+        self.changed.notify_waiters();
         for (i, j) in dups {
             out[i] = out[j];
         }
         out
     }
 
-    /// Drops entries whose exp has passed.
+    /// Low-priority warmup, computed independently on every node. Do not flood the region network
+    /// with the entire initial dataset; sharing remains enabled for foreground/new-image misses.
+    pub fn precompute(&self, jobs: &[(Id, [u8; 32])], exp: i64) {
+        let todo: Vec<_> = {
+            let c = self.cache.lock();
+            jobs.iter().filter(|(id, _)| !c.contains_key(&(*id, exp))).copied().collect()
+        };
+        if todo.is_empty() {
+            return;
+        }
+        let sigs = compute_batch(Backend::get(), &todo, exp);
+        {
+            let mut c = self.cache.lock();
+            for ((id, _), sig) in todo.iter().zip(sigs) {
+                c.entry((*id, exp)).or_insert(Entry { sig, peer: false });
+            }
+        }
+        self.stats.precomputed.fetch_add(todo.len() as u64, Relaxed);
+        self.changed.notify_waiters();
+    }
+
+    /// Keep the current/next signing generations, rather than 24 hourly copies of the dataset.
+    /// Older, still-valid URLs continue through normal verification and can be recomputed.
+
     pub fn purge(&self, now_s: i64) {
-        self.cache.lock().retain(|(_, exp), _| *exp > now_s);
+        let current = self.exp_for(now_s);
+        if self.purged_generation.swap(current, Relaxed) == current {
+            return;
+        }
+        self.cache.lock().retain(|(_, exp), _| *exp > now_s && *exp >= current);
     }
 
     pub fn clear(&self) {
@@ -356,6 +405,7 @@ impl Signer {
             "render": {"hit_local": g(&s.render_hit_local), "hit_peer": g(&s.render_hit_peer), "miss": g(&s.render_miss)},
             "verify": {"hit_local": g(&s.verify_hit_local), "hit_peer": g(&s.verify_hit_peer), "miss": g(&s.verify_miss)},
             "computed": g(&s.computed),
+            "precomputed": g(&s.precomputed),
             "peer_received": g(&s.peer_received),
             "share_outbox": self.outbox_len(),
             "share_dropped": g(&s.shared_dropped),
@@ -459,5 +509,64 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prewarm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn precomputed_signatures_wake_waiters_without_flooding_peer_outbox() {
+        let signer = Signer::new(3600);
+        signer.enable_sharing();
+        let jobs = [(Id::new_v4(), [7; 32]), (Id::new_v4(), [9; 32])];
+        let exp = signer.exp_for(1_800_000);
+        let changed = signer.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        signer.precompute(&jobs, exp);
+        tokio::time::timeout(std::time::Duration::from_secs(1), changed).await.expect("warmup wakes signature waiters");
+        for (image, key) in jobs {
+            let expected = compute(&key, image, exp);
+            assert_eq!(signer.peek(image, exp), Some(expected));
+            assert_eq!(signer.verify_cached(image, exp, &expected), Some(true));
+            let mut tampered = expected;
+            tampered[0] ^= 1;
+            assert_eq!(signer.verify_cached(image, exp, &tampered), Some(false));
+        }
+        assert_eq!(signer.stats.precomputed.load(Relaxed), 2);
+        assert_eq!(signer.stats.computed.load(Relaxed), 0);
+        assert_eq!(signer.outbox_len(), 0);
+        signer.precompute(&jobs, exp);
+        assert_eq!(signer.stats.precomputed.load(Relaxed), 2, "already warm images are not recomputed");
+    }
+
+    #[test]
+    fn expiry_rollover_preserves_current_next_and_verifies_evicted_valid_urls() {
+        let signer = Signer::new(3600);
+        let boundary = 1_800_000;
+        let current = signer.exp_for(boundary);
+        let previous = signer.exp_for(boundary - 1);
+        let next = signer.exp_for(boundary + 3600);
+        assert_eq!(current - previous, 3600);
+        assert_eq!(next - current, 3600);
+        assert!(previous > boundary, "previously issued URLs remain unexpired at rollover");
+        let image = Id::new_v4();
+        let key = [11; 32];
+        let jobs = [(image, key)];
+        for exp in [previous, current, next, boundary] {
+            signer.precompute(&jobs, exp);
+        }
+        let old_signature = signer.peek(image, previous).unwrap();
+        signer.purge(boundary);
+        assert_eq!(signer.peek(image, previous), None);
+        assert_eq!(signer.peek(image, boundary), None);
+        assert_eq!(signer.peek(image, current), Some(compute(&key, image, current)));
+        assert_eq!(signer.peek(image, next), Some(compute(&key, image, next)));
+        assert!(signer.verify(&key, image, previous, &old_signature), "eviction cannot invalidate an unexpired URL");
+        signer.purge(boundary + 3600);
+        assert_eq!(signer.peek(image, current), None);
+        assert_eq!(signer.peek(image, next), Some(compute(&key, image, next)));
     }
 }

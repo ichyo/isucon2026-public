@@ -41,6 +41,7 @@ pub struct App {
     pub metrics: crate::metrics::Metrics,
     /// batches concurrent image-signature verification misses into SIMD passes
     pub sigbatch: crate::sigshare::VerifyBatcher,
+    pub sigwarm: crate::sigwarm::Warmer,
 }
 
 /// The authenticated session user (copied out of the state; safe to keep across awaits).
@@ -144,12 +145,7 @@ impl App {
     /// Finishes a JSON response: computes missing image signatures in the blocking pool (off-lock),
     /// appends `\n`, `Content-Type: application/json`.
     pub async fn finish(&'static self, w: JsonOut, status: u16) -> HResult {
-        let body = if w.pending_signatures() == 0 {
-            w.finish()
-        } else {
-            let _permit = crate::rt::sign_permits().acquire().await.map_err(ApiError::internal)?;
-            tokio::task::spawn_blocking(move || w.finish()).await.map_err(ApiError::internal)?
-        };
+        let body = w.finish_async().await.map_err(ApiError::internal)?;
         Ok(Resp::json(status, body))
     }
 
@@ -209,6 +205,7 @@ impl App {
     pub fn handle_effects(&self, st: &State, fx: &[Effect]) {
         for e in fx {
             match e {
+                Effect::ImageCreated(image, owner) => self.sigwarm.image_created(*image, st.user(*owner).secret_hash),
                 Effect::WindowOpened(w) => self.sse.on_window_opened(st, *w),
                 Effect::UserGone(u) => self.sse.on_user_gone(*u),
                 Effect::Ban { ip, until } => self.bans.set(ip, *until),

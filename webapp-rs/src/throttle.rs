@@ -133,6 +133,7 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             if let (Some(a), serde_json::Value::Object(b)) = (sigs.as_object_mut(), crate::sigshare::stats_json()) {
                 a.extend(b);
             }
+            sigs["warmup"] = app.sigwarm.stats_json();
             v["signatures"] = sigs;
             v["memory"] = memory_json();
             text(200, v.to_string())
