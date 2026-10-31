@@ -16,13 +16,54 @@ use crate::timefmt;
 
 pub const MAX_BODY: usize = 32 * 1024 * 1024;
 
+pub type BodySlot = std::sync::Arc<parking_lot::Mutex<Option<Incoming>>>;
+
+/// Without any body data for this long a drain gives up (the connection is then closed).
+pub const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Outcome of draining the unread rest of a request body before responding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drain {
+    /// nothing left to read
+    None,
+    /// read and discarded this many bytes (connection stays usable)
+    Drained(u64),
+    /// could not consume it (over 32 MiB, client error, idle timeout): hyper will close the connection
+    Failed,
+}
+
+/// Reads and discards the rest of a request body (bounded by MAX_BODY, per-chunk idle timeout).
+pub async fn drain(slot: &BodySlot) -> Drain {
+    use http_body::Body as _;
+    let Some(mut b) = slot.lock().take() else { return Drain::None };
+    if b.is_end_stream() {
+        return Drain::None;
+    }
+    let mut n: u64 = 0;
+    loop {
+        match tokio::time::timeout(DRAIN_IDLE, b.frame()).await {
+            Ok(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    n += d.len() as u64;
+                    if n > MAX_BODY as u64 {
+                        return Drain::Failed;
+                    }
+                }
+            }
+            Ok(None) => return if n == 0 { Drain::None } else { Drain::Drained(n) },
+            Ok(Some(Err(_))) | Err(_) => return Drain::Failed,
+        }
+    }
+}
+
 pub struct Req {
     pub method: Method,
     pub path: String,
     pub(crate) params: SmallVec<[String; 2]>,
     pub(crate) query: Option<String>,
     pub headers: HeaderMap,
-    pub(crate) body: Option<Incoming>,
+    /// shared with the HTTP layer, which drains whatever the handler did not read before responding
+    pub(crate) body: BodySlot,
     pub(crate) body_bytes: Option<Bytes>,
     /// client IP (X-Client-IP verbatim, fallback TCP peer)
     pub ip: String,
@@ -85,7 +126,7 @@ impl Req {
         if let Some(b) = &self.body_bytes {
             return Ok(b.clone());
         }
-        let Some(body) = self.body.take() else { return Ok(Bytes::new()) };
+        let Some(body) = self.body.lock().take() else { return Ok(Bytes::new()) };
         let limited = http_body_util::Limited::new(body, MAX_BODY);
         let b = match limited.collect().await {
             Ok(c) => c.to_bytes(),

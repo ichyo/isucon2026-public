@@ -131,6 +131,11 @@ struct ActionStats {
     repl: Hist,
     req_bytes: AtomicU64,
     resp_bytes: AtomicU64,
+    /// requests whose body the handler left (partly) unread and the HTTP layer drained before responding
+    drained: AtomicU64,
+    drained_bytes: AtomicU64,
+    /// requests answered with body data still unread (413 / ip_banned / drain failure) ⇒ connection closed
+    early_close: AtomicU64,
 }
 
 impl ActionStats {
@@ -143,6 +148,9 @@ impl ActionStats {
             repl: Hist::new(),
             req_bytes: AtomicU64::new(0),
             resp_bytes: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
+            drained_bytes: AtomicU64::new(0),
+            early_close: AtomicU64::new(0),
         }
     }
     fn reset(&self) {
@@ -154,6 +162,9 @@ impl ActionStats {
         self.repl.reset();
         self.req_bytes.store(0, Relaxed);
         self.resp_bytes.store(0, Relaxed);
+        self.drained.store(0, Relaxed);
+        self.drained_bytes.store(0, Relaxed);
+        self.early_close.store(0, Relaxed);
     }
 }
 
@@ -244,6 +255,22 @@ impl Metrics {
         s.per[action].fetch_add(1, Relaxed);
     }
 
+    /// Records what happened to the unread rest of a request body.
+    #[inline]
+    pub fn record_drain(&self, action: usize, d: crate::http::req::Drain) {
+        let Some(a) = self.actions.get(action) else { return };
+        match d {
+            crate::http::req::Drain::None => {}
+            crate::http::req::Drain::Drained(n) => {
+                a.drained.fetch_add(1, Relaxed);
+                a.drained_bytes.fetch_add(n, Relaxed);
+            }
+            crate::http::req::Drain::Failed => {
+                a.early_close.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// Once per second (background task): process CPU% of the second that just ended.
     pub fn tick(&self) {
         let now_wall = self.started.elapsed().as_micros() as u64;
@@ -305,6 +332,9 @@ impl Metrics {
                 "handler_ms_sum": ms(lat_sum.saturating_sub(repl_sum)),
                 "req_bytes": a.req_bytes.load(Relaxed),
                 "resp_bytes": a.resp_bytes.load(Relaxed),
+                "body_drained": a.drained.load(Relaxed),
+                "body_drained_bytes": a.drained_bytes.load(Relaxed),
+                "early_close": a.early_close.load(Relaxed),
             });
             if a.repl.n.load(Relaxed) > 0 {
                 v["repl_wait"] = a.repl.json();

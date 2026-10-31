@@ -28,7 +28,11 @@ pub struct Dims {
 pub fn decode_sync(data: &[u8]) -> Option<Dims> {
     match fast::validate(data) {
         Some(d) => Some(d),
-        None => decode_jd(data),
+        // jpeg-decoder panics on some malformed inputs (Go's image/jpeg returns an error): treat as invalid
+        None => std::panic::catch_unwind(|| decode_jd(data)).unwrap_or_else(|_| {
+            eprintln!("[jpeg] jpeg-decoder panicked on a {}-byte upload; treated as invalid", data.len());
+            None
+        }),
     }
 }
 
