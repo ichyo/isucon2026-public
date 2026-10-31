@@ -105,6 +105,8 @@ async fn control(app: Ctx, req: Request<hyper::body::Incoming>) -> Result<Respon
             };
             let mut repl = repl;
             repl["ack_mode"] = serde_json::json!(format!("{:?}", app.cfg.ack_mode).to_lowercase());
+            repl["repl_priority"] = serde_json::json!(crate::rt::prio_state());
+            repl["gate_silence_ms"] = serde_json::json!(app.cfg.gate_silence_ms);
             repl["async_actions"] = serde_json::json!(app.cfg.async_actions);
             text(200, app.metrics.json_with(app.cfg.node.name(), role, repl))
         }

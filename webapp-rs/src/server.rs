@@ -74,7 +74,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
         "[start] blobs: listen={} peers={:?} inline_max={} bytes (larger uploads stay on their origin node)",
         cfg.blob_listen, cfg.blob_peers, cfg.blob_inline_max
     );
-    eprintln!("[start] replication: ack_mode={:?} async_actions={:?}", cfg.ack_mode, cfg.async_actions);
+    eprintln!(
+        "[start] replication: ack_mode={:?} async_actions={:?} gate_silence_ms={} (runtime: {} threads at nice {}); budgets: jpeg={} sign={} (0 = CPUs)",
+        cfg.ack_mode, cfg.async_actions, cfg.gate_silence_ms, 2, crate::rt::REPL_NICE, cfg.jpeg_concurrency, cfg.sign_concurrency
+    );
     eprintln!("[start] throttle: ms={} feed_ms={} (change: curl -XPOST '{}/throttle?ms=N&feed_ms=M')", cfg.throttle_ms, cfg.throttle_feed_ms, cfg.control_listen);
 
     let dir = cfg.initial_dir.clone();
@@ -88,7 +91,8 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let net = BlobNet::new(cfg.blob_peers.clone());
     let images = ImageStore::open(&cfg.initial_dir, wal.file(), blobs, cache, net).context("opening images.pack")?;
     let statics = StaticFiles::load(&cfg.public_dir);
-    let repl = if cfg.is_leader() { Repl::Leader(repl::Leader::new()) } else { Repl::Follower(repl::Follower::new()) };
+    crate::rt::init_budgets(cfg.jpeg_concurrency, cfg.sign_concurrency);
+    let repl = if cfg.is_leader() { Repl::Leader(repl::Leader::new()) } else { Repl::Follower(repl::Follower::new(cfg.gate_silence_ms)) };
     let app: &'static App = Box::leak(Box::new(App {
         throttle: Throttle::new(cfg.throttle_ms, cfg.throttle_feed_ms),
         signer: Signer::new(cfg.exp_quantum),
@@ -131,15 +135,18 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let mut repl_addr = None;
     match &app.repl {
         Repl::Leader(_) => {
-            let l = TcpListener::bind(&app.cfg.repl_listen).await.with_context(|| format!("bind repl {}", app.cfg.repl_listen))?;
+            // bound on the replication runtime so its driver (not the request runtime's) serves the socket
+            let l = crate::rt::spawn(async move { TcpListener::bind(&app.cfg.repl_listen).await })
+                .await?
+                .with_context(|| format!("bind repl {}", app.cfg.repl_listen))?;
             repl_addr = Some(l.local_addr()?);
-            tokio::spawn(repl::leader::serve(app, l));
+            crate::rt::spawn(repl::leader::serve(app, l));
             if app.cfg.ack_mode == crate::config::AckMode::Direct {
-                tokio::spawn(repl::leader::run_synced_broadcast(app));
+                crate::rt::spawn(repl::leader::run_synced_broadcast(app));
             }
         }
         Repl::Follower(_) => {
-            tokio::spawn(repl::follower::run(app));
+            crate::rt::spawn(repl::follower::run(app));
             if app.cfg.ack_mode == crate::config::AckMode::Direct {
                 // direct acks go to every other follower (the leader gets its ACK over the link)
                 let peers: Vec<_> = crate::model::NodeId::ALL.into_iter().filter(|&n| n != app.cfg.node && n != app.cfg.leader_node).collect();
@@ -150,10 +157,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
 
     // internal blob service (every node serves its own blobs.dat)
     let mut blob_addr = None;
-    match TcpListener::bind(&app.cfg.blob_listen).await {
+    match crate::rt::spawn(async move { TcpListener::bind(&app.cfg.blob_listen).await }).await? {
         Ok(l) => {
             blob_addr = Some(l.local_addr()?);
-            tokio::spawn(crate::blobs::serve(&app.images.blobs, &app.images.net, l));
+            crate::rt::spawn(crate::blobs::serve(&app.images.blobs, &app.images.net, l));
         }
         Err(e) => eprintln!("[start] WARN cannot bind blob service {}: {e} (other nodes cannot fetch this node's uploads!)", app.cfg.blob_listen),
     }

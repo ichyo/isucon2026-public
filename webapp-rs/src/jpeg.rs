@@ -35,8 +35,9 @@ pub fn decode_full_sync(data: &[u8]) -> Option<Dims> {
     Some(Dims { width: info.width, height: info.height })
 }
 
-/// Full decode in the blocking pool.
+/// Decode in the blocking pool, at most `ISUREAL_JPEG_CONCURRENCY` at a time (CPU budget, rt.rs).
 pub async fn decode(data: Bytes) -> Option<Dims> {
+    let _permit = crate::rt::jpeg_permits().acquire().await.ok()?;
     tokio::task::spawn_blocking(move || decode_sync(&data)).await.ok().flatten()
 }
 

@@ -57,7 +57,17 @@ pub struct Config {
     pub ack_mode: AckMode,
     /// ISUREAL_ASYNC_ACTIONS: actions answered after the leader's own apply + WAL only (default none)
     pub async_actions: Vec<&'static str>,
+    /// ISUREAL_GATE_SILENCE_MS: a follower stops serving after this long without any frame from the leader
+    /// (must stay well below the leader's 25 s drop timeout)
+    pub gate_silence_ms: u64,
+    /// ISUREAL_JPEG_CONCURRENCY / ISUREAL_SIGN_CONCURRENCY (0 = number of CPUs)
+    pub jpeg_concurrency: usize,
+    pub sign_concurrency: usize,
 }
+
+/// Upper bound for ISUREAL_GATE_SILENCE_MS (the leader drops a silent follower after 25 s and only then acks
+/// writes without it; the follower must have stopped serving long before).
+pub const MAX_GATE_SILENCE_MS: u64 = 15_000;
 
 fn parse_async_actions(s: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -157,6 +167,15 @@ impl Config {
                 Some(o) => bail!("invalid ISUREAL_ACK_MODE {o:?} (leader|direct)"),
             },
             async_actions: parse_async_actions(&env("ISUREAL_ASYNC_ACTIONS").unwrap_or_default()),
+            gate_silence_ms: {
+                let v = num("ISUREAL_GATE_SILENCE_MS", 10_000)?;
+                if v > MAX_GATE_SILENCE_MS {
+                    eprintln!("[config] ISUREAL_GATE_SILENCE_MS={v} too large; using {MAX_GATE_SILENCE_MS}");
+                }
+                v.clamp(100, MAX_GATE_SILENCE_MS)
+            },
+            jpeg_concurrency: num("ISUREAL_JPEG_CONCURRENCY", 0)? as usize,
+            sign_concurrency: num("ISUREAL_SIGN_CONCURRENCY", 0)? as usize,
         })
     }
 
@@ -184,6 +203,9 @@ impl Config {
             log_debug: false,
             ack_mode: AckMode::Leader,
             async_actions: Vec::new(),
+            gate_silence_ms: 2_000,
+            jpeg_concurrency: 0,
+            sign_concurrency: 0,
         }
     }
 

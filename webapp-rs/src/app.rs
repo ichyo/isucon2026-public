@@ -145,6 +145,7 @@ impl App {
         let body = if w.pending_signatures() == 0 {
             w.finish()
         } else {
+            let _permit = crate::rt::sign_permits().acquire().await.map_err(ApiError::internal)?;
             tokio::task::spawn_blocking(move || w.finish()).await.map_err(ApiError::internal)?
         };
         Ok(Resp::json(status, body))
@@ -189,7 +190,13 @@ impl App {
         // replication wait for the request metrics: leader = submit → all acked, follower = forward round trip
         let t = std::time::Instant::now();
         let r = match &self.repl {
-            Repl::Leader(l) => l.submit(self, cmd, crate::repl::Origin::Local, policy).await,
+            // exec + replication + ack waits run on the high-priority replication runtime
+            Repl::Leader(_) => crate::rt::spawn(async move {
+                let Repl::Leader(l) = &self.repl else { unreachable!() };
+                l.submit(self, cmd, crate::repl::Origin::Local, policy).await
+            })
+            .await
+            .unwrap_or_else(|e| Err(ApiError::internal(format!("submit task: {e}")))),
             Repl::Follower(f) => f.forward(cmd).await,
         };
         crate::metrics::add_repl_wait(t.elapsed());

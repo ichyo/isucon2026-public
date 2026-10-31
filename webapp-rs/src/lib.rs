@@ -16,6 +16,7 @@ pub mod loader;
 pub mod metrics;
 pub mod model;
 pub mod repl;
+pub mod rt;
 pub mod rules;
 pub mod server;
 pub mod sha256mb;

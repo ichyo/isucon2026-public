@@ -90,6 +90,7 @@ impl BlobStore {
             std::thread::Builder::new()
                 .name("blob-fsync".into())
                 .spawn(move || {
+                    crate::rt::set_thread_nice(crate::rt::REPL_NICE);
                     let mut done = 0u64;
                     loop {
                         let target = {
@@ -353,7 +354,7 @@ impl BlobNet {
     pub fn spawn_ack_broadcast(&'static self, me: NodeId, peers: Vec<NodeId>) {
         for peer in peers {
             let mut rx = self.my_ack.subscribe();
-            tokio::spawn(async move {
+            crate::rt::spawn(async move {
                 loop {
                     if rx.changed().await.is_err() {
                         return;
@@ -395,17 +396,20 @@ impl BlobNet {
             }
         }
         let addr = self.peers.lock()[origin.idx()].clone().ok_or_else(|| format!("no blob peer for {}", origin.name()))?;
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        // the socket and its tasks live on the replication runtime (direct acks ride on this connection)
+        let a2 = addr.clone();
+        let stream = crate::rt::spawn(async move { tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&a2)).await })
             .await
+            .map_err(|e| format!("connect {addr}: {e}"))?
             .map_err(|_| format!("connect {addr}: timeout"))?
             .map_err(|e| format!("connect {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
         let (mut rd, wr) = stream.into_split();
         let (tx, rx) = mpsc::unbounded_channel();
         let c = Arc::new(ClientConn { tx, pending: Mutex::new(FxHashMap::default()), dead: AtomicBool::new(false) });
-        tokio::spawn(proto::writer_loop(wr, rx));
+        crate::rt::spawn(proto::writer_loop(wr, rx));
         let rc = c.clone();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let r: io::Result<()> = async {
                 loop {
                     let (ty, payload) = proto::read_frame(&mut rd).await?;

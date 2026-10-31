@@ -25,8 +25,9 @@ use crate::model::ImageLoc;
 /// Longer than the leader's ACK_TIMEOUT (a slow peer follower can delay the response that long).
 pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
-/// Without any frame from the leader for this long the follower stops serving (leader sends heartbeats every 250 ms).
-pub const LEASE: Duration = Duration::from_millis(2000);
+/// Default read lease (ISUREAL_GATE_SILENCE_MS): without any frame from the leader for this long the follower
+/// stops serving (the leader sends heartbeats every 250 ms and drops a silent follower only after 25 s).
+pub const LEASE: Duration = Duration::from_millis(10_000);
 /// How long an API request waits for the follower to become in sync before answering 503.
 pub const SYNC_WAIT: Duration = Duration::from_secs(3);
 /// ACK_MODE=direct: how long the origin waits for direct acks before relying on the leader's RESPONSE.
@@ -43,7 +44,6 @@ struct Pending {
     blob: Option<Bytes>,
 }
 
-#[derive(Default)]
 pub struct Follower {
     conn: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
     pending: Mutex<FxHashMap<u64, Pending>>,
@@ -59,11 +59,27 @@ pub struct Follower {
     early_done: AtomicU64,
     early_fallback: AtomicU64,
     early_wait_us: AtomicU64,
+    lease_us: u64,
 }
 
 impl Follower {
-    pub fn new() -> Follower {
-        Follower::default()
+    pub fn new(gate_silence_ms: u64) -> Follower {
+        Follower {
+            conn: Mutex::new(None),
+            pending: Mutex::new(FxHashMap::default()),
+            next_req: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+            caught_up: AtomicBool::new(false),
+            resetting: AtomicBool::new(false),
+            last_frame_us: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+            gate_waits: AtomicU64::new(0),
+            gate_503: AtomicU64::new(0),
+            early_done: AtomicU64::new(0),
+            early_fallback: AtomicU64::new(0),
+            early_wait_us: AtomicU64::new(0),
+            lease_us: gate_silence_ms.max(1) * 1000,
+        }
     }
 
     /// Forwards a command to the leader and waits for its outcome (by then the resulting records are applied
@@ -102,7 +118,7 @@ impl Follower {
         self.connected.load(Ordering::SeqCst)
             && self.caught_up.load(Ordering::SeqCst)
             && !self.resetting.load(Ordering::SeqCst)
-            && mono_us().saturating_sub(self.last_frame_us.load(Ordering::SeqCst)) < LEASE.as_micros() as u64
+            && mono_us().saturating_sub(self.last_frame_us.load(Ordering::SeqCst)) < self.lease_us
     }
 
     /// Waits (bounded) until in sync. `false` ⇒ answer 503.

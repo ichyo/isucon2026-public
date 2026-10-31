@@ -29,6 +29,8 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(25);
 /// Acks slower than this are logged (rate-limited) and counted.
 pub const SLOW_ACK: Duration = Duration::from_secs(1);
 pub const RESET_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wait after dropping a non-acking link before acknowledging writes without it.
+pub const DROP_GRACE: Duration = Duration::from_secs(1);
 /// Idle links get a heartbeat this often (keeps the follower's read lease alive).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_millis(250);
 const CATCHUP_CHUNK: u64 = 4 << 20;
@@ -118,6 +120,9 @@ impl Link {
             if el >= ACK_TIMEOUT {
                 eprintln!("[repl] link {} ({}) did not ack seq {seq} within {:?}; dropping it", self.id, self.node.name(), ACK_TIMEOUT);
                 self.kill();
+                // the follower stops serving when it sees the connection close (≈ RTT) or, if partitioned, it
+                // stopped already (gate silence ≤ 15 s < ACK_TIMEOUT): give the close time to arrive
+                tokio::time::sleep(DROP_GRACE).await;
                 break;
             }
             if !counted {

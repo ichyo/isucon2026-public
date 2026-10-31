@@ -127,6 +127,7 @@ impl Wal {
         std::thread::Builder::new()
             .name("wal-fsync".into())
             .spawn(move || {
+                crate::rt::set_thread_nice(crate::rt::REPL_NICE);
                 let mut done = 0u64;
                 loop {
                     let target = {
