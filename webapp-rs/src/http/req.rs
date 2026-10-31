@@ -18,6 +18,67 @@ pub const MAX_BODY: usize = 32 * 1024 * 1024;
 
 pub type BodySlot = std::sync::Arc<parking_lot::Mutex<Option<Incoming>>>;
 
+// ---- bounded body buffering ------------------------------------------------------------------------------
+
+/// Global budget for buffered request bodies (KiB permits; ISUREAL_BODY_BUDGET_MB, default 600). A request
+/// reserves min(Content-Length, its cap) before reading and waits when the budget is exhausted.
+static BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+static BUDGET_KIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600 * 1024);
+/// bytes currently reserved by buffered bodies / peak / requests that had to wait
+pub static BODY_BYTES_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BODY_BYTES_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BODY_BUDGET_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// uploads rejected without buffering (over their cap / not a JPEG prefix)
+pub static BODY_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn init_body_budget(mb: u64) {
+    let kib = (mb.max(64) * 1024).min(u32::MAX as u64 / 2);
+    BUDGET_KIB.store(kib, std::sync::atomic::Ordering::Relaxed);
+    let _ = BUDGET.set(std::sync::Arc::new(tokio::sync::Semaphore::new(kib as usize)));
+}
+
+fn budget() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    BUDGET.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(BUDGET_KIB.load(std::sync::atomic::Ordering::Relaxed) as usize)))
+}
+
+pub fn budget_kib() -> u64 {
+    BUDGET_KIB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A reservation in the body budget (released on drop, i.e. when the request finishes).
+pub struct BudgetGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    bytes: u64,
+}
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        BODY_BYTES_IN_USE.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn reserve(bytes: u64) -> Option<BudgetGuard> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kib = (bytes.div_ceil(1024)).clamp(1, budget_kib()) as u32;
+    let sem = budget().clone();
+    let permit = match sem.clone().try_acquire_many_owned(kib) {
+        Ok(p) => p,
+        Err(_) => {
+            BODY_BUDGET_WAITS.fetch_add(1, Relaxed);
+            sem.acquire_many_owned(kib).await.ok()?
+        }
+    };
+    let now = BODY_BYTES_IN_USE.fetch_add(bytes, Relaxed) + bytes;
+    BODY_BYTES_PEAK.fetch_max(now, Relaxed);
+    Some(BudgetGuard { _permit: permit, bytes })
+}
+
+/// Result of a capped body read.
+pub enum Capped {
+    Body(Bytes),
+    /// over the cap, or not starting with the required prefix: the rest was read and discarded unstored
+    Rejected,
+}
+
 /// Without any body data for this long a drain gives up (the connection is then closed).
 pub const DRAIN_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -30,6 +91,15 @@ pub enum Drain {
     Drained(u64),
     /// could not consume it (over 32 MiB, client error, idle timeout): hyper will close the connection
     Failed,
+}
+
+/// Unread rests up to this size are drained before an early response (keep-alive); larger ones are not received.
+pub const SMALL_DRAIN: usize = 64 * 1024;
+
+/// Whether request body data may still be unread.
+pub fn body_pending(slot: &BodySlot) -> bool {
+    use http_body::Body as _;
+    slot.lock().as_ref().is_some_and(|b| !b.is_end_stream())
 }
 
 /// Reads and discards the rest of a request body (bounded by MAX_BODY, per-chunk idle timeout).
@@ -68,6 +138,8 @@ pub struct Req {
     /// client IP (X-Client-IP verbatim, fallback TCP peer)
     pub ip: String,
     pub start: Instant,
+    /// body-budget reservation held until the request finishes
+    pub(crate) budget: Option<BudgetGuard>,
 }
 
 impl Req {
@@ -123,23 +195,93 @@ impl Req {
 
     /// Reads the whole body (≤ 32 MiB, else 413). Cached: may be called more than once.
     pub async fn body_bytes(&mut self) -> Result<Bytes, ApiError> {
-        if let Some(b) = &self.body_bytes {
-            return Ok(b.clone());
+        match self.body_capped(MAX_BODY, None).await? {
+            Capped::Body(b) => Ok(b),
+            Capped::Rejected => Err(ApiError::new(413, "Request Entity Too Large")),
         }
-        let Some(body) = self.body.lock().take() else { return Ok(Bytes::new()) };
-        let limited = http_body_util::Limited::new(body, MAX_BODY);
-        let b = match limited.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-                    return Err(ApiError::new(413, "Request Entity Too Large"));
-                }
-                return Err(ApiError::bind(format!("read body: {e}")));
+    }
+
+    /// Reads the body as it arrives, buffering at most `cap` bytes (reserved in the global body budget first).
+    /// Content-Length over `cap` ⇒ `Capped::Rejected` without receiving anything; over `cap` mid-stream or first
+    /// bytes not matching `prefix` ⇒ stop receiving, `Capped::Rejected` (the rest stays unread; the HTTP layer
+    /// answers with `Connection: close`). > 32 MiB ⇒ 413.
+    pub async fn body_capped(&mut self, cap: usize, prefix: Option<&[u8]>) -> Result<Capped, ApiError> {
+        use http_body::Body as _;
+        if let Some(b) = &self.body_bytes {
+            return Ok(Capped::Body(b.clone()));
+        }
+        let Some(mut body) = self.body.lock().take() else { return Ok(Capped::Body(Bytes::new())) };
+        if body.is_end_stream() {
+            let b = Bytes::new();
+            self.body_bytes = Some(b.clone());
+            return Ok(match prefix {
+                Some(p) if !p.is_empty() => Capped::Rejected,
+                _ => Capped::Body(b),
+            });
+        }
+        let declared = self.header("content-length").and_then(|v| v.parse::<u64>().ok());
+        if declared.is_some_and(|n| n > cap as u64) {
+            // decided from the header: nothing is received (the HTTP layer answers with Connection: close)
+            *self.body.lock() = Some(body);
+            BODY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Capped::Rejected);
+        }
+        let want = declared.map_or(cap as u64, |n| n.min(cap as u64));
+        if self.budget.is_none() {
+            self.budget = reserve(want).await;
+        }
+        // with a prefix check (profile image) start small: abusive bodies are usually rejected by their first bytes
+        let initial = if prefix.is_some() { want.min(64 * 1024) } else { want };
+        let mut buf = bytes::BytesMut::with_capacity(initial as usize);
+        let mut total: usize = 0;
+        let mut rejected = false;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| ApiError::bind(format!("read body: {e}")))?;
+            let Ok(data) = frame.into_data() else { continue };
+            total += data.len();
+            if total > MAX_BODY {
+                *self.body.lock() = Some(body);
+                return Err(ApiError::new(413, "Request Entity Too Large"));
             }
-        };
+            if buf.len() + data.len() > cap {
+                rejected = true;
+                break;
+            }
+            buf.extend_from_slice(&data);
+            if let Some(p) = prefix {
+                let n = buf.len().min(p.len());
+                if buf[..n] != p[..n] {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        if rejected {
+            // stop receiving: the rest stays unread (the HTTP layer answers with Connection: close + lingering close)
+            *self.body.lock() = Some(body);
+        }
+        if let Some(p) = prefix {
+            if !rejected && buf.len() < p.len() {
+                rejected = true;
+            }
+        }
         crate::metrics::set_body_recv(self.start.elapsed());
+        if rejected {
+            BODY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Capped::Rejected);
+        }
+        let b = buf.freeze();
         self.body_bytes = Some(b.clone());
-        Ok(b)
+        Ok(Capped::Body(b))
+    }
+
+    /// `bind` with the whole body capped at `cap` bytes: `Ok(None)` when it is larger (nothing buffered beyond
+    /// the cap; the caller answers with the error its own validation would give, e.g. 400 invalid_post).
+    pub async fn bind_capped(&mut self, cap: usize) -> Result<Option<Body>, ApiError> {
+        match self.body_capped(cap, None).await? {
+            Capped::Rejected => Ok(None),
+            Capped::Body(_) => self.bind().await.map(Some),
+        }
     }
 
     /// Binds the body per §2.5: empty ⇒ `Body::Empty`; `application/json` ⇒ object; form-urlencoded /

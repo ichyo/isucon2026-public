@@ -16,12 +16,16 @@ fn invalid() -> ApiError {
     ApiError::bad_request("invalid_realmoji")
 }
 
+/// Max buffered multipart body for a RealMoji (≤ 512 px image ≤ 4 MiB + form fields).
+pub const REALMOJI_BODY_CAP: usize = 4 * 1024 * 1024 + 64 * 1024;
+
 // POST /api/posts/{postId}/realmojis — auth user, pinned, multipart (`image` file, `reactionType`).
 // Input checks (400) all come before any state check; the JPEG is fully decoded off-lock before ctx.write.
 pub async fn replace_real_moji(ctx: Ctx, mut req: Req) -> HResult {
     let me = ctx.auth_pinned(&req)?;
     let post = req.param(0).to_string();
-    let body = req.bind().await?;
+    // bounded buffering: over REALMOJI_BODY_CAP ⇒ the same 400 invalid_realmoji the decoder would give
+    let Some(body) = req.bind_capped(REALMOJI_BODY_CAP).await? else { return Err(invalid()) };
     let reaction = body.str("reactionType")?; // binding error (wrong JSON type) ⇒ 400 first
     let image = body.file("image").ok_or_else(invalid)?.data.clone();
     drop(body);

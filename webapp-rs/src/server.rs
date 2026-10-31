@@ -106,6 +106,7 @@ pub async fn start(cfg: Config) -> anyhow::Result<Node> {
     let images = ImageStore::open(&cfg.initial_dir, wal.file(), blobs, cache, net).context("opening images.pack")?;
     let statics = StaticFiles::load(&cfg.public_dir);
     crate::rt::init_budgets(cfg.jpeg_concurrency, cfg.sign_concurrency);
+    crate::http::req::init_body_budget(cfg.body_budget_mb);
     let repl = if cfg.is_leader() { Repl::Leader(repl::Leader::new()) } else { Repl::Follower(repl::Follower::new(cfg.gate_silence_ms)) };
     let app: &'static App = Box::leak(Box::new(App {
         throttle: Throttle::new(cfg.throttle_ms, cfg.throttle_feed_ms),

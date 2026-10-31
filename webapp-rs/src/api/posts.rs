@@ -26,10 +26,15 @@ fn parse_location(kind: Option<&str>, lat: Option<f64>, lng: Option<f64>, locali
     }
 }
 
+/// Max buffered multipart body for a post (image part ≤ 16 MiB + form fields).
+pub const POST_BODY_CAP: usize = 16 * 1024 * 1024 + 64 * 1024;
+
 // POST /api/posts — auth user, pinned, multipart. The JPEG is decoded BEFORE ctx.write.
 pub async fn create_post(ctx: Ctx, mut req: Req) -> HResult {
     let me = ctx.auth_pinned(&req)?;
-    let body = req.bind().await?;
+    // bounded buffering: a body over POST_BODY_CAP cannot hold a ≤ 4096 px JPEG we accept ⇒ invalid_post
+    // (every check that could come first answers the same 400 invalid_post); the rest is drained unstored
+    let Some(body) = req.bind_capped(POST_BODY_CAP).await? else { return Err(ApiError::bad_request("invalid_post")) };
     // 1. binding errors (wrong JSON types, unparsable floats)
     let caption = body.str("caption")?.unwrap_or_default();
     let visibility = body.str("visibility")?;
