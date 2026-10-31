@@ -72,7 +72,7 @@ pub async fn put_profile_image(ctx: Ctx, mut req: Req) -> HResult {
         crate::http::req::Capped::Rejected => return Err(invalid().abuse(Abuse::InvalidImage)),
     };
     // full decode in the blocking pool, before (and outside) the write path
-    let dims = jpeg::decode(image.clone(), jpeg::Lane::Small).await.ok_or_else(|| invalid().abuse(Abuse::InvalidImage))?;
+    let dims = jpeg::decode(image.clone()).await.ok_or_else(|| invalid().abuse(Abuse::InvalidImage))?;
     if dims.width > PROFILE_IMAGE_MAX || dims.height > PROFILE_IMAGE_MAX {
         return Err(invalid());
     }

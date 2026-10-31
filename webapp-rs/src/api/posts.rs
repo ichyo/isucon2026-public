@@ -54,7 +54,7 @@ pub async fn create_post(ctx: Ctx, mut req: Req) -> HResult {
     let location = parse_location(kind.as_deref(), lat, lng, locality).ok_or_else(invalid)?;
     drop(body);
     // 5. full JPEG decode (blocking pool), ≤ 4096×4096
-    match jpeg::decode(image.clone(), jpeg::Lane::Post).await {
+    match jpeg::decode(image.clone()).await {
         Some(d) if d.width <= 4096 && d.height <= 4096 => {}
         _ => return Err(invalid()),
     }
